@@ -1,0 +1,50 @@
+{:paths ["src" "resources"]
+ :deps {org.clojure/clojure {:mvn/version "1.12.3"}
+        org.clojure/tools.cli {:mvn/version "1.1.230"}
+        camel-snake-kebab/camel-snake-kebab {:mvn/version "0.4.3"}
+        ;; HTTP routing / validation
+        metosin/reitit {:mvn/version "0.10.1"}
+        fi.metosin/reitit-openapi {:mvn/version "0.10.1"}
+        metosin/reitit-swagger-ui {:mvn/version "0.10.1"}
+        metosin/reitit-malli {:mvn/version "0.10.1"}
+        metosin/malli {:mvn/version "0.20.1"}
+        metosin/muuntaja {:mvn/version "0.6.11"}
+        ring/ring-jetty-adapter {:mvn/version "1.15.4"}
+        cheshire/cheshire {:mvn/version "5.13.0"}
+        clj-http/clj-http {:mvn/version "3.13.0"}
+        com.taoensso/timbre {:mvn/version "6.8.0"}
+        integrant/integrant {:mvn/version "1.0.1"}
+        aero/aero {:mvn/version "1.1.6"}
+        ;; Database
+        migratus/migratus {:mvn/version "1.6.5"}
+        org.postgresql/postgresql {:mvn/version "42.7.10"}
+        com.github.seancorfield/next.jdbc {:mvn/version "1.3.1093"}
+        com.github.seancorfield/honeysql {:mvn/version "2.7.1368"}
+        com.zaxxer/HikariCP {:mvn/version "7.0.2"}}
+
+ :aliases
+ {:run {:main-opts ["-m" "grout.main"]}
+
+  :test {:extra-paths ["test"]
+         :extra-deps {lambdaisland/kaocha {:mvn/version "1.91.1392"}
+                      ring/ring-mock {:mvn/version "0.4.0"}
+                      com.h2database/h2 {:mvn/version "2.2.220"}}
+         :main-opts ["-m" "kaocha.runner"]}
+
+  :migrate {:extra-deps {migratus/migratus {:mvn/version "1.6.5"}}
+            :exec-fn grout.migrate/run-migrations!
+            :exec-args {:action "migrate"}}
+
+  :repl {:extra-deps {nrepl/nrepl {:mvn/version "1.3.0"}
+                      cider/cider-nrepl {:mvn/version "0.50.2"}}
+         :main-opts ["-m" "nrepl.cmdline"
+                     "--middleware" "[cider.nrepl/cider-middleware]"
+                     "--port" "7888"]}
+
+  :outdated {:replace-deps {olical/depot {:mvn/version "2.4.1"}}
+             :main-opts ["-m" "depot.outdated.main"]}
+
+  :lint {:replace-deps {clj-kondo/clj-kondo {:mvn/version "2025.02.20"}}
+         :main-opts ["-m" "clj-kondo.main"
+                     "--lint" "src" "test"
+                     "--fail-level" "error"]}}}

@@ -1,0 +1,153 @@
+{
+  description = "Grout -- filler and interstitial media store";
+
+  inputs = {
+    nixpkgs.url = "github:nixos/nixpkgs/nixos-25.11";
+    flake-utils.url = "github:numtide/flake-utils";
+    nix-helpers = {
+      url = "github:fudoniten/fudo-nix-helpers";
+      inputs.nixpkgs.follows = "nixpkgs";
+    };
+  };
+
+  outputs = { self, nixpkgs, flake-utils, nix-helpers }:
+    flake-utils.lib.eachDefaultSystem (system:
+      let
+        pkgs = nixpkgs.legacyPackages.${system};
+        helpers = nix-helpers.legacyPackages.${system};
+
+        grout = helpers.mkClojureBin {
+          name = "org.fudo/grout";
+          primaryNamespace = "grout.main";
+          src = ./.;
+        };
+
+        migratusRunner = helpers.mkClojureBin {
+          name = "org.fudo/grout-migrate";
+          primaryNamespace = "grout.migrate";
+          src = ./.;
+        };
+
+        versionInfo = let
+          gitCommit = self.rev or self.dirtyRev or "unknown";
+          gitTimestamp = if self ? lastModified then
+            let ts = toString self.lastModified;
+            in "${builtins.substring 0 4 ts}${builtins.substring 4 2 ts}${builtins.substring 6 2 ts}"
+          else
+            "dev";
+          versionTag = "${builtins.substring 0 7 gitCommit}-${gitTimestamp}";
+        in { inherit gitCommit gitTimestamp versionTag; };
+
+      in {
+        packages = rec {
+          default = grout;
+          inherit grout migratusRunner;
+
+          deployContainer = let version = versionInfo;
+          in helpers.deployContainers {
+            name = "grout";
+            repo = "registry.kube.sea.fudo.link";
+            tags = [ "latest" version.versionTag ];
+            # Keep ffmpeg/ffprobe on PATH for the intake/normalize pipeline.
+            pathEnv = with pkgs; [ ffmpeg ];
+            env = {
+              GIT_COMMIT = version.gitCommit;
+              GIT_TIMESTAMP = version.gitTimestamp;
+              VERSION = version.versionTag;
+              FFMPEG_PATH = "${pkgs.ffmpeg}/bin/ffmpeg";
+              FFPROBE_PATH = "${pkgs.ffmpeg}/bin/ffprobe";
+            };
+            entrypoint =
+              let grout = self.packages."${system}".grout;
+              in [ "${grout}/bin/grout" ];
+            verbose = true;
+          };
+
+          deployMigrationContainer = let version = versionInfo;
+          in helpers.deployContainers {
+            name = "grout-migratus";
+            repo = "registry.kube.sea.fudo.link";
+            tags = [ "latest" version.versionTag ];
+            env = {
+              GIT_COMMIT = version.gitCommit;
+              GIT_TIMESTAMP = version.gitTimestamp;
+              VERSION = version.versionTag;
+            };
+            entrypoint =
+              let migratus = self.packages."${system}".migratusRunner;
+              in [ "${migratus}/bin/grout-migrate" ];
+            verbose = true;
+          };
+
+          deployContainers = pkgs.writeShellScriptBin "deployContainers" ''
+            set -euo pipefail
+            echo "🚀 Deploying grout containers"
+            echo "Version: ${versionInfo.versionTag}"
+            echo "Commit: ${versionInfo.gitCommit}"
+            echo "Timestamp: ${versionInfo.gitTimestamp}"
+            echo ""
+
+            echo "📦 Building and pushing primary container..."
+            ${self.packages."${system}".deployContainer}/bin/deployContainers
+
+            echo ""
+            echo "📦 Building and pushing migration container..."
+            ${self.packages."${system}".deployMigrationContainer}/bin/deployContainers
+
+            echo ""
+            echo "✅ Both containers deployed successfully!"
+            echo "  Primary: registry.kube.sea.fudo.link/grout:${versionInfo.versionTag}"
+            echo "  Migrate: registry.kube.sea.fudo.link/grout-migratus:${versionInfo.versionTag}"
+          '';
+        };
+
+        checks = {
+          clojureTests = helpers.mkClojureTests {
+            name = "org.fudo/grout";
+            src = ./.;
+          };
+          lint = pkgs.runCommand "grout-lint" {
+            nativeBuildInputs = [ pkgs.clj-kondo ];
+          } ''
+            clj-kondo \
+              --lint ${./src} ${./test} \
+              --fail-level error
+            touch $out
+          '';
+        };
+
+        devShells = rec {
+          default = updateDeps;
+          updateDeps = pkgs.mkShell {
+            buildInputs = [ (helpers.updateClojureDeps { aliases = [ "test" ]; }) ];
+          };
+          grout = pkgs.mkShell {
+            packages = with pkgs; [ clojure jdk21 ffmpeg postgresql ];
+          };
+        };
+
+        apps = rec {
+          default = deployContainers;
+          deployContainers = {
+            type = "app";
+            program = "${self.packages."${system}".deployContainers}/bin/deployContainers";
+          };
+          deployContainer = {
+            type = "app";
+            program = "${self.packages."${system}".deployContainer}/bin/deployContainers";
+          };
+          deployMigrationContainer = {
+            type = "app";
+            program = "${self.packages."${system}".deployMigrationContainer}/bin/deployContainers";
+          };
+          migrate = {
+            type = "app";
+            program = "${migratusRunner}/bin/grout-migrate";
+          };
+          groutApp = {
+            type = "app";
+            program = "${grout}/bin/grout";
+          };
+        };
+      });
+}
