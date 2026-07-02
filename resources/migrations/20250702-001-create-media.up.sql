@@ -1,4 +1,5 @@
 CREATE EXTENSION IF NOT EXISTS pgcrypto;
+--;;
 
 CREATE TABLE grout_media (
   id           uuid PRIMARY KEY DEFAULT gen_random_uuid(),
@@ -19,8 +20,13 @@ CREATE TABLE grout_media (
   created_at   timestamptz NOT NULL DEFAULT now(),
   superseded_at timestamptz
 );
+--;;
 
 CREATE INDEX grout_media_tags_gin ON grout_media USING gin (tags);
+--;;
 CREATE INDEX grout_media_duration ON grout_media (duration_ms);
+--;;
 CREATE INDEX grout_media_channel_kind ON grout_media (channel, kind);
+--;;
 CREATE INDEX grout_media_live ON grout_media (superseded_at) WHERE superseded_at IS NULL;
+--;;
