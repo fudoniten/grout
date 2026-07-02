@@ -10,7 +10,8 @@
             [grout.db :as db]
             [grout.http.media :as media]
             [grout.http.middleware :as mw]
-            [grout.http.schemas :as s]))
+            [grout.http.schemas :as s]
+            [grout.http.stream :as stream]))
 
 (defn health-handler
   "Construct the health handler, closing over the datasource."
@@ -90,6 +91,14 @@
               :responses {200 {:body s/DeleteResult}
                           404 {:body s/APIError}}
               :handler (media/delete-handler media)}}]
+
+   ["/grout/media/:id/stream"
+    {:get {:tags ["media"]
+           :summary "Byte-range HTTP streaming fallback (supports Range -> 206)"
+           :parameters {:path s/IdPath}
+           :responses {404 {:body s/APIError}
+                       416 {:body s/APIError}}
+           :handler (stream/stream-handler media)}}]
 
    ["/grout/media/:id/tags"
     {:get {:tags ["media"]
