@@ -1,8 +1,33 @@
 {:log-level #or [#env GROUT_LOG_LEVEL :info]
  :server {:port #or [#env GROUT_HTTP_PORT 8080]}
- :database {:jdbc-url  #or [#env GROUT_DATABASE_URL
+
+ ;; DATABASE_URL is the GROUT.md §11 name; the GROUT_-prefixed vars take
+ ;; precedence for ops isolation when both are set.
+ :database {:jdbc-url  #or [#env GROUT_DATABASE_URL #env DATABASE_URL
                             "jdbc:postgresql://localhost:5432/grout"]
             :username  #or [#env GROUT_DATABASE_USER "grout"]
             :password  #or [#env GROUT_DATABASE_PASS "grout"]}
- :media {:media-dir #or [#env GROUT_MEDIA_DIR "/data/media/grout"]}
- :tunabrain {:endpoint #or [#env TUNABRAIN_URL "http://tunabrain:8080"]}}
+
+ :media {:media-dir #or [#env GROUT_MEDIA_DIR "/data/media/grout"]
+         ;; Playout profile for intake normalization (GROUT.md §8).
+         :profile {:vcodec "h264"
+                   :pix-fmt "yuv420p"
+                   :acodec "aac"
+                   :sample-rate 48000
+                   :channels 2
+                   :audio-bitrate "192k"}}
+
+ :tunabrain {:endpoint #or [#env TUNABRAIN_URL "http://tunabrain:8080"]
+             :model #or [#env GROUT_TUNABRAIN_MODEL "openrouter/auto"]
+             :timeout-ms 30000}
+
+ ;; Async metadata enrichment sweep (GROUT.md §9).
+ :enrichment {:enabled #or [#env GROUT_ENRICHMENT_ENABLED true]
+              :interval-ms 60000
+              :batch-size 10}
+
+ ;; Retention caps per (channel, kind, duration-bucket) (GROUT.md §10).
+ :retention {:enabled #or [#env GROUT_RETENTION_ENABLED true]
+             :interval-ms 3600000
+             :cap 20
+             :bucket-ms 5000}}
