@@ -106,6 +106,15 @@
   (let [response (call (handler) (mock/request :get "/no-such-route"))]
     (is (= 404 (:status response)))))
 
+(deftest openapi-spec-is-served
+  (let [response (call (handler) (mock/request :get "/openapi.json"))
+        body (:body response)]
+    (is (= 200 (:status response)))
+    (is (map? body) "spec must be a real body, not an empty/nil response")
+    (is (= "3.1.0" (:openapi body)))
+    (is (contains? (:paths body) (keyword "/grout/media/{id}"))
+        "media routes must appear in the generated spec")))
+
 ;; --- media query -----------------------------------------------------------
 
 (deftest query-returns-summaries
@@ -223,6 +232,20 @@
   (with-redefs [store/find-by-id (fn [_ _ & _] nil)]
     (let [resp (call (handler) (mock/request :get (str "/grout/media/" sample-id)))]
       (is (= 404 (:status resp))))))
+
+(deftest get-one-invalid-uuid-is-400
+  ;; A non-UUID id in the path is a client error, not a 500. Health/monitoring
+  ;; probes (hermes-probe) discover /grout/media/{id} from the OpenAPI spec and
+  ;; hit it with a placeholder; the request-coercion failure must surface as a
+  ;; clean 400 rather than a 500 with the whole request dumped at ERROR.
+  (doseq [bad ["abc" "123" "not-a-uuid"]]
+    (let [resp (call (handler) (mock/request :get (str "/grout/media/" bad)))]
+      (is (= 400 (:status resp)) (str "GET /grout/media/" bad " should be 400"))
+      (is (string? (get-in resp [:body :error]))))))
+
+(deftest delete-invalid-uuid-is-400
+  (let [resp (call (handler) (mock/request :delete "/grout/media/not-a-uuid"))]
+    (is (= 400 (:status resp)))))
 
 ;; --- patch -----------------------------------------------------------------
 

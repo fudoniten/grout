@@ -3,6 +3,7 @@
   (:require [muuntaja.core :as m]
             [cheshire.core :as json]
             [camel-snake-kebab.core :as csk]
+            [malli.error :as me]
             [taoensso.timbre :as log])
   (:import [java.time Instant]
            [com.fasterxml.jackson.core JsonGenerator]))
@@ -21,16 +22,42 @@
                   :encoders {Instant java-instant-encoder}}))))
 
 (defn exception-middleware
-  "Catches exceptions from handlers and returns structured error responses."
+  "Catches exceptions from handlers and coercion, returning structured error
+   responses.
+
+   Reitit request-coercion failures (a bad UUID in the path, a malformed query
+   param, an invalid JSON body) are *client* errors: they become 400s with a
+   humanized message and are logged at INFO. Previously they fell through to the
+   generic branch, which had no :status to read and so returned 500 while
+   dumping the entire request + router map at ERROR — turning a routine bad
+   probe (e.g. GET /grout/media/abc) into log noise and a misleading server
+   error. Response-coercion failures mean the server produced a body that
+   violates its own schema, so those stay 500s but are still logged compactly."
   [handler]
   (fn [request]
     (try
       (handler request)
       (catch clojure.lang.ExceptionInfo e
         (let [data (ex-data e)]
-          (log/error e "Handler exception" data)
-          {:status (or (:status data) 500)
-           :body {:error (or (ex-message e) "request failed")}}))
+          (case (:type data)
+            :reitit.coercion/request-coercion
+            (let [humanized (me/humanize data)]
+              (log/info "Request coercion failed"
+                        {:uri (:uri request) :in (:in data) :errors humanized})
+              {:status 400
+               :body {:error (str "Invalid request parameters: " (pr-str humanized))}})
+
+            :reitit.coercion/response-coercion
+            (do
+              (log/error "Response coercion failed"
+                         {:uri (:uri request) :in (:in data) :errors (me/humanize data)})
+              {:status 500
+               :body {:error "Internal server error"}})
+
+            (do
+              (log/error e "Handler exception" data)
+              {:status (or (:status data) 500)
+               :body {:error (or (ex-message e) "request failed")}}))))
       (catch Exception e
         (log/error e "Unexpected exception")
         {:status 500
