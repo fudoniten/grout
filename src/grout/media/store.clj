@@ -194,18 +194,25 @@
   enrichment attempt if a human corrects the grounding).
 
   Writeable fields:
-    * `:name`                  — human-set only; AI does NOT set this
-    * `:description`           — human-set only; AI does NOT set this
+    * `:name`                  — AI fills when missing, never overwrites
+                                 a human-set value. The merge step
+                                 (`media.enrich/merge-enrichment`)
+                                 omits `:name` from the payload
+                                 entirely when the row already has one,
+                                 so this fn only writes the column
+                                 when there's actually something new
+                                 to write.
+    * `:description`           — same shape as `:name`.
     * `:tags`                  — replaces the column; union is the
                                  caller's responsibility (see
-                                 `media.enrich/merge-enrichment`)
+                                 `media.enrich/merge-enrichment`).
     * `:enrichment-context`    — the `MediaContext` Tunabrain returned;
-                                 stored as JSONB and replayed on retry
+                                 stored as JSONB and replayed on retry.
     * `:enrichment-grounding-source` — the `context.source` value
                                  (provided-text / provided-summary /
                                  provided-link / wikipedia / none);
                                  diagnostic for \"did the auto-search
-                                 land right?\" — diagnostic only
+                                 land right?\" — diagnostic only.
 
   Returns the row, or nil if the row is missing."
   [ds id {:keys [name description tags enrichment-context

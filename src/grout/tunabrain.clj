@@ -2,32 +2,33 @@
   "HTTP client for the Tunabrain service.
 
   Tunabrain exposes typed, purposeful endpoints — not a generic chat
-  completions gateway. Grout uses two of them:
+  completions gateway. Grout uses the single composite endpoint
+  `/enrich/short-form`, which orchestrates describe + categorize + tags
+  internally and returns the merged result. See the Tunabrain OpenAPI
+  spec for the request/response shape; this client just threads Clojure
+  data through `cheshire` + `clj-http` and adds a small layer of
+  error context.
 
-    * `POST /categorize` — structured dimensions (audience, channel, ...).
-      The caller (Grout) supplies the `categories` map (the dimension
-      definitions); Tunabrain returns `DimensionSelection[]` drawn from
-      those allowed values.
+  The `/enrich/short-form` response carries:
 
-    * `POST /tags` — free-form tags. Caller supplies `existing_tags`;
-      Tunabrain returns a `tags: string[]` it recommends, with
-      preference to reuse values from `existing_tags` when possible.
+    * `:media`     — the request `MediaItem` echoed back (caller's
+                     working title, NOT the AI's refinement)
+    * `:describe`  — a `DescribeMedia` map with the AI's refined title
+                     and description; nil if the describe step failed
+    * `:dimensions` — sequence of `DimensionSelection` maps
+    * `:tags`     — sequence of recommended tag strings
+    * `:context`  — the `MediaContext` Tunabrain actually used
+    * `:cost_estimate` — the `CostEstimate` for the call(s) made
+    * `:warnings` — list of non-fatal issues
 
-  Both endpoints return a `MediaContext` object in the response
-  (`{text, links, summary, source}`) that Grout persists verbatim and
-  replays on the next attempt. The `summary` is the resolved reference
-  text the model actually saw (Wikipedia article, YouTube page, or
-  whatever the operator stored); the `source` is the provenance. If the
-  model landed on a bad Wikipedia match, the operator fixes the
-  `summary` and the next call re-tags against the fix.
-
-  See `resources/grout-tunabrain-enrichment-requirements.md` for the
-  full design (the design doc explains why we don't use the OpenAI
-  chat-completions shape and how the two-form media model maps to these
-  two endpoints)."
+  The `context` is persisted verbatim into `enrichment_context` and
+  replayed on retry, per the `MediaContext` design. The
+  `description` (the AI's) is the field the caller adopts into the
+  row's `description` column via the never-clobber rule in
+  `media.enrich/merge-enrichment`. The same applies to the describe
+  `title` for the row's `name`."
   (:require [cheshire.core :as json]
             [clj-http.client :as http]
-            [clojure.pprint :refer [pprint]]
             [clojure.string :as str]
             [taoensso.timbre :as log]))
 
@@ -73,8 +74,8 @@
                                      :throw-exceptions   false
                                      :body               (json/generate-string payload)}
                                     (:http-opts client))
-                       timeout-ms (assoc :socket-timeout timeout-ms))]
-    (log/debug (format "tunabrain POST %s, payload: %s" url (with-out-str (pprint payload))))
+                           timeout-ms (assoc :socket-timeout timeout-ms))]
+    (log/debug (format "tunabrain POST %s, payload: %s" url (json/generate-string payload)))
     (try
       (let [{:keys [status body]} (http/post url request-opts)]
         (if (<= 200 status 299)
@@ -163,81 +164,63 @@
 ;; Public client API
 ;; ---------------------------------------------------------------------------
 
-(defn request-categorization!
-  "POST /categorize.
+(defn request-enrich-short-form!
+  "POST /enrich/short-form — the single-call composite that replaces the
+  prior two-call pattern (request-categorization! + request-tags!).
+
+  Tunabrain orchestrates categorize + tags internally and adds a
+  describe step that produces a display title + description.
 
   Arguments:
     client     — a `TunabrainClient`
     row        — a Grout `Media` map (or any map with `:id` and `:name`)
     dim-config — dimension definitions, see `build-categories`
-    channels   — optional sequence of `Channel` maps (`{:name ... :description ...}`)
-                 to consider for the deprecated `mappings` response field.
-                 Defaults to `[]`.
+    existing-tags — the row's current tags (Tunabrain reuses these when
+                    possible)
     context    — optional `MediaContext` from a previous call. Replays
                  the operator's last corrected grounding. Defaults to nil.
 
-  Returns a map with three keys:
-    `:dimensions` — sequence of `DimensionSelection` maps from Tunabrain
-    `:mappings`   — sequence of `ChannelMapping` maps (deprecated but
-                     still returned; we persist it for backwards compat)
-    `:context`    — the `MediaContext` that was actually used. Caller
-                     must persist this verbatim. `:source` reveals
-                     which grounding path was used.
+  Returns a map with these keys:
+    `:media`     — the request `MediaItem` echoed back (caller's working
+                   title, not the AI-refined one)
+    `:describe`  — a `DescribeMedia` map with the AI-refined title and
+                   description; `nil` only if the describe step failed
+    `:dimensions` — sequence of `DimensionSelection` maps
+    `:tags`     — sequence of recommended tag strings
+    `:context`  — the `MediaContext` Tunabrain actually used
+    `:cost_estimate` — the `CostEstimate` map
+    `:warnings` — list of non-fatal issues
 
   Throws on HTTP error (5xx, 4xx other than 422), connection refused,
   or unknown host. The orchestrator catches the exception and leaves
   the row `enriched=false` for the next sweep."
-  [client row dim-config & {:keys [channels context]
-                            :or   {channels []}}]
-  (let [payload {:media      (media->tunabrain row)
-                 :categories (build-categories dim-config)
-                 :channels   (vec channels)
-                 :context    context}
-        resp    (json-post! client "/categorize" payload)]
+  [client row dim-config existing-tags & {:keys [context]}]
+  (let [payload {:media        (media->tunabrain row)
+                 :categories   (build-categories dim-config)
+                 :existing_tags (vec existing-tags)
+                 :context      context
+                 :channels     []}
+        resp    (json-post! client "/enrich/short-form" payload)]
     (when-not (map? resp)
-      (throw (ex-info "Tunabrain /categorize returned non-map"
+      (throw (ex-info "Tunabrain /enrich/short-form returned non-map"
                       {:response resp})))
     (when-not (sequential? (:dimensions resp))
-      (throw (ex-info "Tunabrain /categorize missing :dimensions"
-                      {:response resp})))
-    (log/info (format "Categorize response: %d dimensions, %d mappings"
-                      (count (:dimensions resp))
-                      (count (or (:mappings resp) []))))
-    {:dimensions (vec (:dimensions resp))
-     :mappings   (vec (or (:mappings resp) []))
-     :context    (:context resp)}))
-
-(defn request-tags!
-  "POST /tags.
-
-  Arguments:
-    client        — a `TunabrainClient`
-    row           — a Grout `Media` map
-    existing-tags — the row's current tags (Tunabrain reuses these when
-                    possible)
-    context       — optional `MediaContext` from a previous call
-
-  Returns a map with two keys:
-    `:tags`    — sequence of recommended tag strings
-    `:context` — the `MediaContext` Tunabrain actually used (caller
-                 persists verbatim). `:source` reveals which grounding
-                 path was used.
-
-  Throws on HTTP error. The orchestrator catches and logs."
-  [client row existing-tags & {:keys [context]}]
-  (let [payload {:media         (media->tunabrain row)
-                 :existing_tags (vec existing-tags)
-                 :context       context}
-        resp    (json-post! client "/tags" payload)]
-    (when-not (map? resp)
-      (throw (ex-info "Tunabrain /tags returned non-map"
+      (throw (ex-info "Tunabrain /enrich/short-form missing :dimensions"
                       {:response resp})))
     (when-not (sequential? (:tags resp))
-      (throw (ex-info "Tunabrain /tags missing :tags"
+      (throw (ex-info "Tunabrain /enrich/short-form missing :tags"
                       {:response resp})))
-    (log/info (format "Tag response: %d tags" (count (:tags resp))))
-    {:tags    (vec (:tags resp))
-     :context (:context resp)}))
+    (log/info (format "Enrich short-form: %d dimensions, %d tags, describe=%s"
+                      (count (:dimensions resp))
+                      (count (:tags resp))
+                      (if (:describe resp) "yes" "no")))
+    {:media         (:media resp)
+     :describe      (:describe resp)
+     :dimensions    (vec (:dimensions resp))
+     :tags          (vec (:tags resp))
+     :context       (:context resp)
+     :cost_estimate (:cost_estimate resp)
+     :warnings      (vec (or (:warnings resp) []))}))
 
 (defn build-dimension-config
   "Assemble the dimension config for the `request-categorization!`
