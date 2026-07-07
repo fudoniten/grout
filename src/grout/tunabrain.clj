@@ -185,8 +185,8 @@
                      which grounding path was used.
 
   Throws on HTTP error (5xx, 4xx other than 422), connection refused,
-  or unknown host. Returns nil-... no — throws, and the orchestrator
-  catches."
+  or unknown host. The orchestrator catches the exception and leaves
+  the row `enriched=false` for the next sweep."
   [client row dim-config & {:keys [channels context]
                             :or   {channels []}}]
   (let [payload {:media      (media->tunabrain row)

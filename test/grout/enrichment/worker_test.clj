@@ -29,6 +29,25 @@
     (is (= [{:audience {:description "A" :values ["kids"]}} 1] @captured)
         "the worker's orchestrator map's :dim-config is forwarded to enrich-one!")))
 
+;; Regression: ensure the worker unwraps :tunabrain from the orchestrator
+;; map before passing it to enrich-one!. The pre-fix code passed the
+;; whole map, which made the TunabrainClient read :endpoint on the
+;; media map (where it doesn't exist) and call a nil host. The original
+;; review was: "every scheduled enrichment sweep will build a request
+;; against a nil host and fail — permanently, in production."
+(deftest run-once-unwraps-tunabrain-client-from-orchestrator-map
+  (let [fake-client    (reify Object (toString [_] "fake-tunabrain-client"))
+        orchestrator   {:tunabrain fake-client
+                        :dim-config {:audience {:description "A" :values ["kids"]}}}
+        captured-client (atom nil)]
+    (with-redefs [store/unenriched  (fn [_ _] [{:id 1}])
+                  enrich/enrich-one! (fn [_ client _dim-config _id]
+                                       (reset! captured-client client)
+                                       nil)]
+      (worker/run-once! nil orchestrator 10))
+    (is (identical? fake-client @captured-client)
+        "the 2nd arg to enrich-one! must be the TunabrainClient record (from :tunabrain), not the orchestrator map")))
+
 (deftest run-once-continues-past-errors
   (let [processed (atom [])]
     (with-redefs [store/unenriched  (fn [_ _] [{:id 1} {:id 2}])

@@ -305,6 +305,35 @@
       (is (= 200 (:status resp)))
       (is (= "bumper" (get-in resp [:body :kind]))))))
 
+;; Regression: enrich-handler must pass the TunabrainClient (from
+;; :tunabrain on the media map) and the dim-config (from :dim-config on
+;; the media map) to enrich-one! — not the whole media map as either arg.
+;;
+;; The pre-fix code destructured `{:keys [ds tunabrain]}` and then read
+;; `(:dim-config tunabrain)` — but `tunabrain` was the TunabrainClient
+;; record (only :endpoint / :http-opts), so :dim-config was always nil.
+;; This test asserts the wiring is correct: the dim-config arg must be
+;; the map from the :grout/media component, not nil.
+(deftest enrich-endpoint-forwards-dim-config-from-media-map
+  (let [captured (atom nil)
+        fake-client (reify Object (toString [_] "fake-tunabrain-client"))
+        ;; The media map has :tunabrain (the client) and :dim-config
+        ;; (the catalog). It also has :ds, the rest are ignored.
+        media-map {:ds fake-db
+                   :tunabrain fake-client
+                   :dim-config {:audience {:description "A" :values ["kids"]}}}]
+    (with-redefs [enrich/enrich-one! (fn [ds client dim-config id]
+                                       (reset! captured {:ds ds :client client
+                                                         :dim-config dim-config :id id})
+                                       sample-row)]
+      (call (handler-with media-map)
+            (mock/request :post (str "/grout/media/" sample-id "/enrich"))))
+    (is (identical? fake-db (:ds @captured)))
+    (is (identical? fake-client (:client @captured))
+        "the 2nd arg to enrich-one! must be the TunabrainClient (not the whole media map)")
+    (is (= {:audience {:description "A" :values ["kids"]}} (:dim-config @captured))
+        "the 3rd arg to enrich-one! must be the dim-config from the media map, not nil")))
+
 (deftest enrich-endpoint-404-when-missing
   (with-redefs [enrich/enrich-one! (fn [_ _ _ _] nil)
                 store/find-by-id (fn [_ _ & _] nil)]

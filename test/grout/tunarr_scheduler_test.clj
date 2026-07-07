@@ -39,10 +39,10 @@
     (with-redefs [http/get (fake-get responses)]
       (let [result (ts/fetch-dimensions! cl dim-descriptions)]
         (is (= 2 (count result)))
-        (is (= "Audience segments" (get-in result ["audience" :description])))
-        (is (= ["kids" "teen"] (get-in result ["audience" :values])))
-        (is (= "Tunarr Scheduler channels" (get-in result ["channel" :description])))
-        (is (= ["britannia" "goldenreels"] (get-in result ["channel" :values]))
+        (is (= "Audience segments" (get-in result [:audience :description])))
+        (is (= ["kids" "teen"] (get-in result [:audience :values])))
+        (is (= "Tunarr Scheduler channels" (get-in result [:channel :description])))
+        (is (= ["britannia" "goldenreels"] (get-in result [:channel :values]))
             "values are sorted alphabetically")))))
 
 (deftest fetch-dimensions-falls-back-to-generic-description-for-unlisted-dim
@@ -56,9 +56,9 @@
     (with-redefs [http/get (fake-get responses)]
       (let [result (ts/fetch-dimensions! cl dim-descriptions)]
         (is (= "Dimension 'mood' from Tunarr Scheduler"
-               (get-in result ["mood" :description]))
+               (get-in result [:mood :description]))
             "unlisted dimension gets the generic fallback description")
-        (is (= ["happy" "sad"] (get-in result ["mood" :values])))))))
+        (is (= ["happy" "sad"] (get-in result [:mood :values])))))))
 
 (deftest fetch-dimensions-skips-dimension-on-individual-fetch-failure
   (let [audience-body (json/generate-string
@@ -72,8 +72,38 @@
     (with-redefs [http/get (fake-get responses)]
       (let [result (ts/fetch-dimensions! cl dim-descriptions)]
         (is (= 1 (count result)) "only the working dimension is in the result")
-        (is (contains? result "audience"))
-        (is (not (contains? result "broken")))))))
+        (is (contains? result :audience))
+        (is (not (contains? result :broken)))))))
+
+;; Regression: the pre-fix `fetch-dimensions!` had `(name name)` where
+;; `{:keys [name]}` shadowed `clojure.core/name`, so the inner call
+;; crashed with a ClassCastException. The exception was swallowed by
+;; the per-dimension try/catch, so every dimension was silently
+;; skipped — the catalog always came back as `{}`. This test would
+;; have failed under that bug (count is 2, not 0) and passes under
+;; the fix.
+(deftest fetch-dimensions-does-not-shadow-clojure-core-name
+  ;; Same body as fetch-dimensions-builds-categories-from-list-and-values
+  ;; but with the assertion phrased to specifically catch a swallowed
+  ;; exception: we check that BOTH dimensions are in the result, not
+  ;; just that the result is non-empty. Under the shadowing bug, every
+  ;; dimension would be silently skipped and the result would be {}.
+  (let [audience-body (json/generate-string
+                        {:values [{:value "kids" :usage-count 10}]})
+        channel-body  (json/generate-string
+                        {:values [{:value "goldenreels" :usage-count 50}]})
+        catalog-body  (json/generate-string
+                        {:dimensions [{:name "audience" :value-count 1}
+                                      {:name "channel"  :value-count 1}]})
+        responses     {(str endpoint "/api/dimensions")              {:status 200 :body catalog-body}
+                       (str endpoint "/api/dimensions/audience/values") {:status 200 :body audience-body}
+                       (str endpoint "/api/dimensions/channel/values")  {:status 200 :body channel-body}}]
+    (with-redefs [http/get (fake-get responses)]
+      (let [result (ts/fetch-dimensions! cl dim-descriptions)]
+        (is (= 2 (count result))
+            "both dimensions must be present (the pre-fix shadowing bug silently dropped them all)")
+        (is (every? #(contains? result %) [:audience :channel])
+            "each dimension name must be a key in the result map")))))
 
 (deftest fetch-dimensions-throws-on-404
   (with-redefs [http/get (constantly {:status 404 :body "not found"})]

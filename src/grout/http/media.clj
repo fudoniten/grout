@@ -156,9 +156,9 @@
       {:status 201 :body {:tags (vec (:tags row))}}
       not-found)))
 
-(defn enrich-handler [{:keys [ds tunabrain]}]
+(defn enrich-handler [{:keys [ds] :as media}]
   (fn [{{{:keys [id]} :path} :parameters}]
-    (if-let [row (enrich/enrich-one! ds tunabrain (:dim-config tunabrain) id)]
+    (if-let [row (enrich/enrich-one! ds (:tunabrain media) (:dim-config media) id)]
       {:status 200 :body (row->full row)}
       (if (store/find-by-id ds id {:include-superseded? true})
         {:status 502 :body {:error "Enrichment failed or produced no metadata"}}

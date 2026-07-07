@@ -149,13 +149,13 @@
                       {:response catalog})))
     (log/info "Fetched dimension catalog" {:count (count dims)})
     (into {}
-          (keep (fn [{:keys [name]}]
-                  (when name
+          (keep (fn [{dim-name :name}]
+                  (when dim-name
                     (try
-                      [(name name) (build-dimension client name dim-descriptions)]
+                      [(keyword (name dim-name)) (build-dimension client dim-name dim-descriptions)]
                       (catch Exception e
                         (log/warn e "Failed to build dimension; skipping"
-                                  {:dim name})
+                                  {:dim dim-name})
                         nil)))))
           dims)))
 

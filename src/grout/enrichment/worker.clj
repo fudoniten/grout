@@ -19,7 +19,7 @@
     (when (seq rows)
       (log/info "Enrichment sweep" {:pending (count rows)})
       (doseq [{:keys [id]} rows]
-        (try (enrich/enrich-one! ds tunabrain (:dim-config tunabrain) id)
+        (try (enrich/enrich-one! ds (:tunabrain tunabrain) (:dim-config tunabrain) id)
              (catch Exception e
                (log/warn e "Enrichment failed for row" {:id id})))))
     (count rows)))
