@@ -106,16 +106,31 @@
 ;; config; `channel` values come from Tunarr Scheduler's `/api/dimensions`).
 ;; ---------------------------------------------------------------------------
 
+(defn- path->title
+  "Derive a rough display title from an on-disk media path: take the file
+  name, drop the extension, and turn `.`/`_` separators into spaces.
+  Returns nil when the path yields nothing usable, so callers can fall
+  back to a sentinel."
+  [path]
+  (when-not (str/blank? path)
+    (let [base   (.getName (java.io.File. ^String path))
+          no-ext (str/replace base #"\.[A-Za-z0-9]{1,5}$" "")
+          spaced (-> no-ext (str/replace #"[._]+" " ") str/trim)]
+      (not-empty spaced))))
+
 (defn- media->tunabrain
-  "Build a Tunabrain `MediaItem` from a Grout row map. We only have the
-  bare minimum: an internal UUID (no external meaning) and a derived
-  filename. Tunabrain's Wikipedia auto-search will not find anything for
-  a derived filename, so we MUST pass a `MediaContext` to ground the
-  model — see `request-categorization!` and `request-tags!` for the
-  call sites."
-  [{:keys [id name]}]
+  "Build a Tunabrain `MediaItem` from a Grout row map. `:name` is human-set
+  and usually absent for bulk media, so the title falls back to a filename
+  derived from `:path`, and only then to the sentinel \"Unknown\".
+
+  We deliberately send the filename (not `<unnamed>`) so Tunabrain has a
+  real string to refine: it strips a placeholder-only title before doing
+  any search, and the filename often carries the actual work name. A
+  `MediaContext` (transcript/keyframes/operator notes) is still the primary
+  grounding — see `request-categorization!` and `request-tags!`."
+  [{:keys [id name path]}]
   {:id (str id)
-   :title (or name "<unnamed>")})
+   :title (or (not-empty name) (path->title path) "Unknown")})
 
 (defn- category-def
   "Format a single dimension's allowed values as a Tunabrain

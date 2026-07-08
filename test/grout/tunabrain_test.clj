@@ -182,9 +182,21 @@
   (is (= {:id "abc-123" :title "Test"}
          (#'tb/media->tunabrain {:id "abc-123" :name "Test"}))))
 
-(deftest media->tunabrain-handles-missing-name
-  (is (= {:id "abc-123" :title "<unnamed>"}
-         (#'tb/media->tunabrain {:id "abc-123"}))))
+(deftest media->tunabrain-prefers-name-over-path
+  (is (= {:id "abc-123" :title "Human Name"}
+         (#'tb/media->tunabrain {:id "abc-123" :name "Human Name"
+                                 :path "/media/some_file.mp4"}))))
+
+(deftest media->tunabrain-derives-title-from-path-when-no-name
+  (is (= {:id "abc-123" :title "keeping motivated 2025"}
+         (#'tb/media->tunabrain
+           {:id "abc-123" :path "/media/keeping_motivated.2025.mp4"}))))
+
+(deftest media->tunabrain-falls-back-to-unknown
+  (is (= {:id "abc-123" :title "Unknown"}
+         (#'tb/media->tunabrain {:id "abc-123"})))
+  (is (= {:id "abc-123" :title "Unknown"}
+         (#'tb/media->tunabrain {:id "abc-123" :name "" :path "  "}))))
 
 ;; --- endpoint sanitization --------------------------------------------------
 
