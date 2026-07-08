@@ -239,6 +239,38 @@
   (is (= {:id "abc-123" :title "<unnamed>"}
          (#'tb/media->tunabrain {:id "abc-123"}))))
 
+;; --- request-enrich-profile! ------------------------------------------------
+;;
+;; Directory-level enrichment: one call derives a shared dimensions+tags
+;; profile for a whole group from its concept name + sampled filenames.
+
+(deftest enrich-profile-builds-correct-wire-shape
+  (let [resp-body (json/generate-string
+                    {:concept_name "Adam Neely Music"
+                     :dimensions {:channel ["muse"] :audience ["adult"]}
+                     :tags ["music" "music-theory"]
+                     :grounding_source "filename-pattern"
+                     :warnings []})]
+    (with-mock (mock-post {:status 200 :body resp-body})
+      (let [result (tb/request-enrich-profile! cl "Adam Neely Music"
+                                               ["a.mp4" "b.mp4" "c.mp4"]
+                                               :sample-count 5)
+            body   (body-as-map)]
+        (is (= (str endpoint "/enrich/profile") (:url @*captured)))
+        (is (= "Adam Neely Music" (:concept_name body)))
+        (is (= ["a.mp4" "b.mp4" "c.mp4"] (:sample_filenames body)))
+        (is (= 5 (:sample_count body)) "explicit sample-count is forwarded")
+        (is (= {:channel ["muse"] :audience ["adult"]} (:dimensions result)))
+        (is (= ["music" "music-theory"] (:tags result)))
+        (is (= "filename-pattern" (:grounding-source result)))))))
+
+(deftest enrich-profile-defaults-sample-count-to-filename-count
+  (with-mock (mock-post {:status 200
+                         :body (json/generate-string {:concept_name "X" :dimensions {} :tags []})})
+    (tb/request-enrich-profile! cl "X" ["one.mp4" "two.mp4"])
+    (is (= 2 (:sample_count (body-as-map)))
+        "sample_count defaults to the number of filenames supplied")))
+
 ;; --- endpoint sanitization --------------------------------------------------
 
 (deftest create-strips-trailing-slashes

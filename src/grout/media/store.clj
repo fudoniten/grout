@@ -5,6 +5,7 @@
    to mirror the database (`:duration_ms`, `:source_url`, ...). The HTTP layer is
    responsible for shaping these into the API's kebab-case response bodies."
   (:require [cheshire.core :as json]
+            [clojure.string :as str]
             [honey.sql :as sql]
             [next.jdbc :as jdbc]
             [next.jdbc.result-set :as rs])
@@ -181,12 +182,23 @@
                 :returning [:*]}))
 
 (defn unenriched
-  "Return up to `limit` live rows still awaiting enrichment (enriched=false)."
+  "Return up to `limit` live rows still awaiting per-file enrichment.
+
+  Excludes rows carrying any `parent-directory:` tag: those are managed by the
+  directory-enrichment pipeline (a shared profile fanned out group-wide), NOT by
+  the per-file Tunabrain sweep. Without this exclusion a bulk import of 200k
+  directory-tagged files would be swept per-file — exactly the cost this feature
+  exists to avoid. Plain SQL (rather than honeysql) so the `unnest`/`LIKE`
+  prefix-exclusion reads unambiguously."
   [ds limit]
-  (exec ds {:select [:id]
-            :from   :grout_media
-            :where  [:and [:= :enriched false] [:= :superseded_at nil]]
-            :limit  limit}))
+  (jdbc/execute! ds
+                 [(str "SELECT id FROM grout_media "
+                       "WHERE enriched = false AND superseded_at IS NULL "
+                       "AND NOT EXISTS ("
+                       "  SELECT 1 FROM unnest(tags) AS t WHERE t LIKE 'parent-directory:%'"
+                       ") LIMIT ?")
+                  limit]
+                 {:builder-fn rs/as-unqualified-lower-maps}))
 
 (defn set-enriched!
   "Mark a row as enriched and persist the AI-derived metadata + the
@@ -231,6 +243,94 @@
                   :set    set-map
                   :where  [:= :id id]
                   :returning [:*]})))
+
+;; ---------------------------------------------------------------------------
+;; Tag-group (directory-level) enrichment support
+;;
+;; These operate on the flat `tags text[]` array via containment (`@>`) and,
+;; for the fan-out UPDATE, Postgres array functions. They use plain
+;; parameterized SQL with a text[] array-literal param (`?::text[]`) rather than
+;; honeysql, because the array/`unnest` shapes are far clearer as literal SQL.
+;; ---------------------------------------------------------------------------
+
+(defn- pg-text-array
+  "Format a Clojure collection of strings as a Postgres array literal string
+   (e.g. `{\"a\",\"b\"}`) suitable for a `?::text[]` cast parameter. Elements are
+   double-quoted with `\\` and `\"` escaped, so tag values with punctuation are
+   safe. An empty collection yields `{}`."
+  [xs]
+  (str "{"
+       (str/join ","
+                 (map (fn [x]
+                        (str \" (-> (str x)
+                                    (str/replace "\\" "\\\\")
+                                    (str/replace "\"" "\\\"")) \"))
+                      xs))
+       "}"))
+
+(defn count-by-tag
+  "Count live rows carrying `tag-value` in their tags array."
+  [ds tag-value]
+  (-> (jdbc/execute-one! ds
+                         ["SELECT count(*) AS n FROM grout_media
+                           WHERE superseded_at IS NULL AND tags @> ?::text[]"
+                          (pg-text-array [tag-value])]
+                         {:builder-fn rs/as-unqualified-lower-maps})
+      :n
+      (or 0)))
+
+(defn- row->filename
+  "Best available original filename for a row: the first `filename:` tag,
+   else `:name`, else the basename of `:path`. Returns nil when nothing usable."
+  [{:keys [tags name path]}]
+  (or (some (fn [t] (when (and (string? t) (str/starts-with? t "filename:"))
+                      (subs t (count "filename:"))))
+            tags)
+      (not-empty name)
+      (when path (not-empty (last (str/split path #"/"))))))
+
+(defn sample-filenames-by-tag
+  "Return up to `limit` representative filenames for the media group carrying
+   `tag-value`, newest first. Used to ground the directory-profile LLM call."
+  [ds tag-value limit]
+  (->> (jdbc/execute! ds
+                      ["SELECT tags, name, path FROM grout_media
+                        WHERE superseded_at IS NULL AND tags @> ?::text[]
+                        ORDER BY created_at DESC LIMIT ?"
+                       (pg-text-array [tag-value]) limit]
+                      {:builder-fn rs/as-unqualified-lower-maps})
+       (keep row->filename)
+       vec))
+
+(defn apply-directory-profile!
+  "Fan a directory profile out to every live row carrying `tag-value`.
+
+  In one set-based UPDATE:
+    * unions `profile-tags` (the dimension-as-tag expansion + free-form tags)
+      into each row's `tags`, removing any `stale-tags` (tags applied by a
+      previous version of this profile that the new one no longer includes),
+    * COALESCE-fills the `channel` column from `channel` (never clobbers a
+      channel set at intake), and
+    * marks the rows `enriched=true`.
+
+  `stale-tags` should be (old-profile-tags \\ new-profile-tags) so a re-enrich
+  that drops a tag also removes it from already-stamped rows, while tags the new
+  profile keeps are preserved. Returns the number of rows updated."
+  [ds tag-value profile-tags stale-tags channel]
+  (let [result (jdbc/execute-one! ds
+                 [(str "UPDATE grout_media "
+                       "SET tags = (SELECT array(SELECT DISTINCT x "
+                       "                         FROM unnest(array_cat(tags, ?::text[])) AS x "
+                       "                         WHERE x <> ALL(?::text[]))), "
+                       "    channel = COALESCE(channel, ?::text), "
+                       "    enriched = true "
+                       "WHERE superseded_at IS NULL AND tags @> ?::text[]")
+                  (pg-text-array profile-tags)
+                  (pg-text-array stale-tags)
+                  channel
+                  (pg-text-array [tag-value])]
+                 {:builder-fn rs/as-unqualified-lower-maps})]
+    (:next.jdbc/update-count result)))
 
 (defn live-rows-for-retention
   "Return the columns the retention job needs for every live row."

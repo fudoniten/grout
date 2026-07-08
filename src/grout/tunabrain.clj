@@ -258,6 +258,48 @@
      :cost_estimate (:cost_estimate resp)
      :warnings      (vec (or (:warnings resp) []))}))
 
+(defn request-enrich-profile!
+  "POST /enrich/profile — derive ONE shared profile (dimensions + tags) for a
+  group of related media from the group's `concept-name` and a sample of its
+  filenames. This is the directory-level enrichment call: one round trip per
+  group, fanned out to every child item by the caller — not a per-file call.
+
+  Arguments:
+    client            — a `TunabrainClient`
+    concept-name      — human-readable group name (e.g. \"Adam Neely Music\")
+    sample-filenames  — a small seq of representative filenames (the only
+                        content signal Tunabrain gets)
+    :sample-count     — optional; the intended sample size (informational).
+                        Defaults to the count actually supplied.
+
+  Returns a map:
+    `:concept-name`     — echoed back
+    `:dimensions`       — `{dimension-keyword [values]}`, e.g. {:channel [\"muse\"]}
+    `:tags`             — vector of free-form tag strings
+    `:grounding-source` — always \"filename-pattern\" in v1
+    `:warnings`         — vector of non-fatal issues
+
+  Throws on HTTP error, connection refused, or unknown host — the caller
+  (directory worker) catches and marks the profile failed for retry."
+  [client concept-name sample-filenames & {:keys [sample-count]}]
+  (let [filenames (vec sample-filenames)
+        payload   {:concept_name    concept-name
+                   :sample_filenames filenames
+                   :sample_count    (or sample-count (count filenames))}
+        resp      (json-post! client "/enrich/profile" payload)]
+    (when-not (map? resp)
+      (throw (ex-info "Tunabrain /enrich/profile returned non-map"
+                      {:response resp})))
+    (log/info (format "Enrich profile '%s': %d dimensions, %d tags"
+                      concept-name
+                      (count (:dimensions resp))
+                      (count (:tags resp))))
+    {:concept-name     (:concept_name resp)
+     :dimensions       (or (:dimensions resp) {})
+     :tags             (vec (or (:tags resp) []))
+     :grounding-source (or (:grounding_source resp) "filename-pattern")
+     :warnings         (vec (or (:warnings resp) []))}))
+
 (defn build-dimension-config
   "Assemble the dimension config for the `request-categorization!`
   call from a Grout-style config map.

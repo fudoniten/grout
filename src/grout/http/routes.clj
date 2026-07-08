@@ -9,6 +9,7 @@
             [reitit.ring.middleware.muuntaja :as muuntaja-mw]
             [ring.middleware.multipart-params :refer [wrap-multipart-params]]
             [grout.db :as db]
+            [grout.http.directory-profiles :as dirprof]
             [grout.http.media :as media]
             [grout.http.middleware :as mw]
             [grout.http.schemas :as s]
@@ -119,6 +120,26 @@
            :responses {404 {:body s/APIError}
                        416 {:body s/APIError}}
            :handler (stream/stream-handler media)}}]
+
+   ["/grout/enrich-by-tag/:tag"
+    {:post {:tags ["directory-profiles"]
+            :summary "Derive/refresh a shared profile for all media carrying a tag"
+            :description "Directory-level enrichment: one LLM call derives dimensions + tags for the whole group and fans them out to every media item carrying `:tag` (typically `parent-directory:<x>`). Async by default (a worker enriches on its next tick); `wait=true` enriches inline. Re-enriches only when the item count has grown past `threshold_pct` (default 20), unless `force=true`."
+            :parameters {:path s/TagPath
+                         :body s/EnrichByTagRequest}
+            :responses {200 {:body s/DirectoryProfile}
+                        202 {:body s/DirectoryProfile}
+                        400 {:body s/APIError}
+                        404 {:body s/APIError}}
+            :handler (dirprof/enrich-by-tag-handler media)}}]
+
+   ["/grout/directory-profiles/:tag"
+    {:get {:tags ["directory-profiles"]
+           :summary "Read a directory/tag-group profile"
+           :parameters {:path s/TagPath}
+           :responses {200 {:body s/DirectoryProfile}
+                       404 {:body s/APIError}}
+           :handler (dirprof/get-profile-handler media)}}]
 
    ["/grout/media/:id/tags"
     {:get {:tags ["media"]

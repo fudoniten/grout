@@ -47,3 +47,23 @@
   (let [[q & params] (fmt {})]
     (is (re-find #"(?i)limit" q))
     (is (some #{10} params))))
+
+;; --- tag-group (directory) helpers -----------------------------------------
+
+(deftest pg-text-array-formats-array-literal
+  (is (= "{\"a\",\"b\"}" (#'store/pg-text-array ["a" "b"])))
+  (is (= "{}" (#'store/pg-text-array [])))
+  (is (= "{\"channel:muse\"}" (#'store/pg-text-array ["channel:muse"]))))
+
+(deftest pg-text-array-quotes-protect-special-chars
+  ;; Double-quoting each element keeps commas/spaces inside a single element.
+  (is (= "{\"a,b\",\"c\"}" (#'store/pg-text-array ["a,b" "c"]))))
+
+(deftest row->filename-prefers-filename-tag
+  (is (= "foo.mp4"
+         (#'store/row->filename {:tags ["content-type:filler" "filename:foo.mp4"]}))))
+
+(deftest row->filename-falls-back-to-name-then-basename
+  (is (= "A Name" (#'store/row->filename {:tags ["x"] :name "A Name"})))
+  (is (= "clip.mp4" (#'store/row->filename {:tags [] :name nil :path "/data/a/b/clip.mp4"})))
+  (is (nil? (#'store/row->filename {:tags [] :name nil :path nil}))))

@@ -49,6 +49,16 @@
               :interval-ms 60000
               :batch-size 10}
 
+ ;; Directory-level (tag-group) enrichment: one Tunabrain /enrich/profile call
+ ;; derives a shared dimensions+tags profile per parent-directory tag and fans
+ ;; it out to every child item, replacing per-file enrichment for bulk imports.
+ ;; The worker sweeps directory_profiles; sample-count is how many filenames it
+ ;; samples per group to ground the LLM call.
+ :directory-enrichment {:enabled #or [#env GROUT_DIRECTORY_ENRICHMENT_ENABLED true]
+                        :interval-ms 60000
+                        :batch-size 10
+                        :sample-count 5}
+
  ;; Retention caps per (channel, kind, duration-bucket) (GROUT.md §10).
  :retention {:enabled #or [#env GROUT_RETENTION_ENABLED true]
              :interval-ms 3600000

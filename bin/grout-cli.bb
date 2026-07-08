@@ -22,6 +22,7 @@ grout-cli — upload/tag filler media on a Grout server
 
 Usage:
   grout-cli [options] <file> [<file> ...]
+  grout-cli --upload-dir DIR [options]
 
 Options:
   -s, --server=URL       Grout server base URL (or set GROUT_URL)
@@ -39,12 +40,20 @@ Options:
   -v, --verbose          Print request details to stderr
   -h, --help             Show this help
 
+Directory-upload mode (--upload-dir):
+      --upload-dir=DIR   Upload every file in DIR (non-recursive), tagging each
+                         with parent-directory:<normalized> + content-type:<kind>,
+                         then trigger one shared directory-level enrichment.
+      --wait             Block on the enrichment call (default: fire-and-forget)
+      --threshold-pct=N  Re-enrich only if the item count grew >N% (default 20)
+
 By default every file also gets a `filename:<basename>` tag, so the original
 filename is always searchable even after enrichment renames it.
 
 Examples:
   grout-cli --tags=daytime,fun bumper1.mp4
   GROUT_URL=http://grout:8080 grout-cli --tag=kids --kind=filler *.mp4
+  grout-cli --upload-dir '/pinchflat-media/Content/Adam Neely Music/'
 ")
 
 (def cli-spec
@@ -57,6 +66,9 @@ Examples:
    :source-url    {}
    :name          {}
    :description   {}
+   :upload-dir    {}
+   :wait          {:coerce :boolean}
+   :threshold-pct {}
    :no-filename-tag {:coerce :boolean}
    :dry-run       {:coerce :boolean}
    :json          {:coerce :boolean}
@@ -77,7 +89,7 @@ Examples:
         (if (str/includes? a "=")
           (recur (rest args) (conj opt-tokens a) files)
           (let [flag (subs a 2)
-                boolean-flag? (contains? #{"no-filename-tag" "dry-run" "json" "verbose" "help"} flag)]
+                boolean-flag? (contains? #{"no-filename-tag" "dry-run" "json" "verbose" "help" "wait"} flag)]
             (if boolean-flag?
               (recur (rest args) (conj opt-tokens a) files)
               (recur (rest (rest args)) (conj opt-tokens a (second args)) files))))
@@ -112,6 +124,18 @@ Examples:
     (->> (str/split s #",")
          (map str/trim)
          (remove str/blank?))))
+
+(defn normalize-dir-name
+  "Normalize a directory name into the `parent-directory:` tag suffix (B1,
+   aggressive): lowercase, collapse every run of non-alphanumerics to a single
+   hyphen, strip leading/trailing hyphens. E.g. 'Adam Neely Music' ->
+   'adam-neely-music', '80s & 90s' -> '80s-90s', 'Tom Scott (extra)' ->
+   'tom-scott-extra'. The original name is preserved as the profile concept."
+  [s]
+  (-> (str s)
+      str/lower-case
+      (str/replace #"[^a-z0-9]+" "-")
+      (str/replace #"^-+|-+$" "")))
 
 (defn- base-url [opts]
   (let [server (or (:server opts) (System/getenv "GROUT_URL"))]
@@ -212,12 +236,71 @@ Examples:
         :else
         {:file file :error (str "unexpected by-hash status " (:status existing))}))))
 
+(defn- enrich-by-tag! [server tag concept-name opts]
+  (let [body (cond-> {:concept_name concept-name}
+               (:wait opts)          (assoc :wait true)
+               (:threshold-pct opts) (assoc :threshold_pct (parse-long (str (:threshold-pct opts)))))]
+    (http-post (str server "/grout/enrich-by-tag/" tag) body (:verbose opts))))
+
+(defn- upload-dir!
+  "Directory-upload mode: tag every file in the directory with
+   parent-directory:<normalized> + content-type:<kind>, upload the new ones,
+   then trigger one shared directory-level enrichment for the group."
+  [opts]
+  (let [server    (base-url opts)
+        dir       (:upload-dir opts)]
+    (when-not (fs/directory? dir)
+      (binding [*out* *err*] (println (str "error: not a directory: " dir)))
+      (System/exit 2))
+    (let [concept    (str (fs/file-name (fs/normalize (fs/absolutize dir))))
+          norm       (normalize-dir-name concept)
+          pd-tag     (str "parent-directory:" norm)
+          ct-tag     (str "content-type:" (:kind opts))
+          base-tags  (vec (distinct (concat [pd-tag ct-tag]
+                                            (:tag opts []) (split-tags (:tags opts)))))
+          files      (->> (fs/list-dir dir) (filter fs/regular-file?) (map str) sort)
+          json?      (:json opts)
+          tally      (atom {:uploaded 0 :existing 0 :failed 0})]
+      (when (empty? files)
+        (binding [*out* *err*] (println (str "error: no files in " dir)))
+        (System/exit 2))
+      (doseq [file files]
+        (let [result (try (process-file! server opts base-tags file)
+                          (catch Exception e {:file file :error (or (ex-message e) (str e))}))]
+          (swap! tally update
+                 (cond (:error result)                              :failed
+                       (#{:uploaded} (:action result))              :uploaded
+                       :else                                        :existing)
+                 inc)
+          (result! json? result)))
+      ;; Fire the shared enrichment for the whole directory (unless a dry run).
+      (let [{:keys [uploaded existing failed]} @tally]
+        (if (:dry-run opts)
+          (if json?
+            (println (json/generate-string {:action "dry-run-plan" :tag pd-tag
+                                             :concept concept :files (count files)}))
+            (println (format "dry-run: would enrich %s (%s files) as tag %s"
+                             concept (count files) pd-tag)))
+          (let [resp    (enrich-by-tag! server pd-tag concept opts)
+                pstatus (get-in resp [:json :status] "unknown")]
+            (if json?
+              (println (json/generate-string {:action "enrich-by-tag" :tag pd-tag
+                                              :concept concept :profile-status pstatus
+                                              :uploaded uploaded :existing existing
+                                              :failed failed}))
+              (println (format "%s: uploaded=%s existing=%s failed=%s profile-status=%s tag=%s"
+                              concept uploaded existing failed pstatus pd-tag)))))
+        (when (pos? failed) (System/exit 1))))))
+
 (defn -main [argv]
   (let [{:keys [opt-tokens files]} (parse-argv argv)
         {:keys [opts]} (cli/parse-args opt-tokens {:spec cli-spec})]
     (cond
       (:help opts)
       (println usage)
+
+      (:upload-dir opts)
+      (upload-dir! opts)
 
       (empty? files)
       (do (println usage)

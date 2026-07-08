@@ -106,6 +106,34 @@
   [:map {:title "TagAddRequest" :description "Body for POST /grout/media/:id/tags."}
    [:tag [:string {:description "Tag to add (idempotent)."}]]])
 
+;; --- Directory / tag-group enrichment --------------------------------------
+
+(def EnrichByTagRequest
+  [:map {:title "EnrichByTagRequest"
+         :description "Body for POST /grout/enrich-by-tag/:tag."}
+   [:concept_name [:string {:description "Human-readable group name fed to the LLM (e.g. 'Adam Neely Music')."}]]
+   [:wait {:optional true} [:boolean {:description "When true, enrich inline and block (30s cap); default false (worker enriches asynchronously)."}]]
+   [:force {:optional true} [:boolean {:description "When true, always re-enrich regardless of the growth threshold."}]]
+   [:threshold_pct {:optional true} [:int {:min 0 :description "Re-enrich only when the item count has grown more than this percent since last enrichment (default 20)."}]]])
+
+(def DirectoryProfile
+  [:map {:title "DirectoryProfile"
+         :description "State of a directory/tag-group profile."}
+   [:status [:enum {:description "Profile status."} "pending" "ready" "failed"]]
+   [:tag [:string {:description "The tag value this profile is keyed on."}]]
+   [:concept-name {:optional true} [:maybe {:description "Human-readable group name."} :string]]
+   [:dimensions {:optional true} [:maybe {:description "Derived dimension selections (dimension -> values); null until ready."}
+                                  [:map-of :keyword [:vector :string]]]]
+   [:tags {:optional true} [:maybe {:description "Derived free-form tags; null until ready."} [:vector :string]]]
+   [:item_count [:int {:description "Current live item count carrying this tag."}]]
+   [:item_count_at_enrichment [:int {:description "Item count recorded at the last enrichment."}]]
+   [:cached {:optional true} [:boolean {:description "True when returned without a new enrichment."}]]
+   [:timed_out {:optional true} [:boolean {:description "True when a wait=true request hit the inline timeout; the worker will finish it."}]]
+   [:error {:optional true} [:maybe {:description "Last failure message when status=failed."} :string]]])
+
+(def TagPath
+  [:map [:tag [:string {:description "Tag value, e.g. 'parent-directory:adam-neely-music'."}]]])
+
 ;; --- Path / query parameter maps -------------------------------------------
 
 (def IdPath
