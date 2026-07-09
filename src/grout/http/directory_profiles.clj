@@ -27,15 +27,15 @@
            :concept-name              (:concept_name profile)
            :dimensions                (:dimensions profile)
            :tags                      (:tags profile)
-           :item_count                item-count
-           :item_count_at_enrichment  (or (:item_count_at_enrichment profile) 0)}
+           :item-count                item-count
+           :item-count-at-enrichment  (or (:item_count_at_enrichment profile) 0)}
     (some? cached)      (assoc :cached cached)
-    (some? timed-out)   (assoc :timed_out timed-out)
+    (some? timed-out)   (assoc :timed-out timed-out)
     (some? (:error profile)) (assoc :error (:error profile))))
 
 (defn enrich-by-tag-handler
-  "POST /grout/enrich-by-tag/:tag. Body: {:concept_name (required) :wait? :force?
-   :threshold_pct?}. Ensures the profile exists, then:
+  "POST /grout/enrich-by-tag/:tag. Body: {:concept-name (required) :wait? :force?
+   :threshold-pct?}. Ensures the profile exists, then:
      * returns the cached `ready` profile when growth is under threshold and not
        forced;
      * otherwise flips it to `pending` (worker enriches on its next tick) and
@@ -43,18 +43,18 @@
        timeout) and returns the result."
   [{:keys [ds tunabrain sample-count]}]
   (fn [{{{:keys [tag]} :path body :body} :parameters}]
-    (let [{:keys [wait force threshold_pct concept_name]} body
-          threshold (or threshold_pct default-threshold-pct)
+    (let [{:keys [wait force threshold-pct concept-name]} body
+          threshold (or threshold-pct default-threshold-pct)
           sc        (or sample-count 5)]
-      (if (str/blank? concept_name)
-        {:status 400 :body {:error "concept_name is required"}}
+      (if (str/blank? concept-name)
+        {:status 400 :body {:error "concept-name is required"}}
         (let [current (store/count-by-tag ds tag)]
           ;; Count before creating the profile row so a tag with no media never
           ;; leaves an orphan `pending` profile behind.
           (if (zero? current)
             {:status 404 :body {:error "No media items carry this tag. Upload files first."}}
             (do
-              (dp/ensure-profile! ds tag concept_name)
+              (dp/ensure-profile! ds tag concept-name)
               (let [profile (dp/get-profile-for-tag ds tag)]
                 (cond
                   ;; Fresh enough — no LLM call.

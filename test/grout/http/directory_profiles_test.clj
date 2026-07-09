@@ -16,13 +16,13 @@
    {:parameters {:path {:tag "parent-directory:x"} :body body}}))
 
 (deftest missing-concept-name-is-400
-  (is (= 400 (:status (post {:concept_name ""}))))
+  (is (= 400 (:status (post {:concept-name ""}))))
   (is (= 400 (:status (post {})))))
 
 (deftest no-media-for-tag-is-404
   (with-redefs [dp/ensure-profile! (fn [& _] {:status "pending"})
                 store/count-by-tag (fn [_ _] 0)]
-    (is (= 404 (:status (post {:concept_name "C"}))))))
+    (is (= 404 (:status (post {:concept-name "C"}))))))
 
 (deftest ready-and-not-grown-returns-cached
   (with-redefs [dp/ensure-profile!     (fn [& _] nil)
@@ -30,7 +30,7 @@
                 dp/get-profile-for-tag (fn [_ _] {:status "ready" :tag_value "parent-directory:x"
                                                   :item_count_at_enrichment 10
                                                   :dimensions {:channel ["muse"]} :tags ["jazz"]})]
-    (let [resp (post {:concept_name "C"})]
+    (let [resp (post {:concept-name "C"})]
       (is (= 200 (:status resp)))
       (is (true? (get-in resp [:body :cached])))
       (is (= {:channel ["muse"]} (get-in resp [:body :dimensions]))))))
@@ -45,7 +45,7 @@
                                            {:status "pending" :tag_value "parent-directory:x"
                                             :item_count_at_enrichment 10})
                   dworker/enrich-profile-one! (fn [& _] (reset! enriched true) nil)]
-      (let [resp (post {:concept_name "C"})]
+      (let [resp (post {:concept-name "C"})]
         (is (= 202 (:status resp)))
         (is (= "pending" (get-in resp [:body :status])))
         (is (true? @marked) "the profile is flipped to pending for the worker")
@@ -60,7 +60,7 @@
                   dp/mark-pending!       (fn [_ _] (reset! marked true)
                                            {:status "pending" :tag_value "parent-directory:x"
                                             :item_count_at_enrichment 10})]
-      (let [resp (post {:concept_name "C" :force true})]
+      (let [resp (post {:concept-name "C" :force true})]
         (is (= 202 (:status resp)))
         (is (true? @marked))))))
 
@@ -75,7 +75,7 @@
                                                 {:status "ready" :tag_value "parent-directory:x"
                                                  :dimensions {:channel ["muse"]} :tags ["x"]
                                                  :item_count_at_enrichment 20})]
-      (let [resp (post {:concept_name "C" :wait true})]
+      (let [resp (post {:concept-name "C" :wait true})]
         (is (= 200 (:status resp)))
         (is (true? @enriched) "wait=true enriches inline")
         (is (= "ready" (get-in resp [:body :status])))

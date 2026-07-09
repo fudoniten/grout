@@ -124,7 +124,7 @@
    ["/grout/enrich-by-tag/:tag"
     {:post {:tags ["directory-profiles"]
             :summary "Derive/refresh a shared profile for all media carrying a tag"
-            :description "Directory-level enrichment: one LLM call derives dimensions + tags for the whole group and fans them out to every media item carrying `:tag` (typically `parent-directory:<x>`). Async by default (a worker enriches on its next tick); `wait=true` enriches inline. Re-enriches only when the item count has grown past `threshold_pct` (default 20), unless `force=true`."
+            :description "Directory-level enrichment: one LLM call derives dimensions + tags for the whole group and fans them out to every media item carrying `:tag` (typically `parent-directory:<x>`). Async by default (a worker enriches on its next tick); `wait=true` enriches inline. Re-enriches only when the item count has grown past `threshold-pct` (default 20), unless `force=true`."
             :parameters {:path s/TagPath
                          :body s/EnrichByTagRequest}
             :responses {200 {:body s/DirectoryProfile}
