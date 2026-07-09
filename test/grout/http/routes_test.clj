@@ -4,6 +4,7 @@
             [clojure.java.io :as io]
             [ring.mock.request :as mock]
             [grout.http.routes :as routes]
+            [grout.directory-profiles :as dp]
             [grout.media.enrich :as enrich]
             [grout.media.intake :as intake]
             [grout.media.store :as store]))
@@ -339,6 +340,43 @@
                 store/find-by-id (fn [_ _ & _] nil)]
     (let [resp (call (handler) (mock/request :post (str "/grout/media/" sample-id "/enrich")))]
       (is (= 404 (:status resp))))))
+
+;; --- directory / tag-group enrichment (Bug 2: request-body wire contract) ----
+
+;; `grout-cli --upload-dir` POSTs the enrich-by-tag body over HTTP; muuntaja
+;; kebab-cases every incoming JSON key *before* Malli coercion, so the request
+;; schema must be kebab-case (`concept-name`). Regression: the schema was
+;; snake_case (`concept_name`), so the coerced body key (`:concept-name`) never
+;; matched the required schema key (`:concept_name`) and *every* request 400'd
+;; with "concept_name: missing required key" regardless of the body's shape.
+;; Both snake_case and kebab-case JSON must now be accepted end-to-end (muuntaja
+;; normalizes both to :concept-name), and the endpoint must reach the handler.
+(deftest enrich-by-tag-accepts-cli-wire-body
+  (with-redefs [store/count-by-tag     (fn [_ _] 4)
+                dp/ensure-profile!     (fn [& _] nil)
+                dp/get-profile-for-tag (fn [_ _] {:status "pending"
+                                                  :tag_value "parent-directory:adam-neely-music"
+                                                  :concept_name "Adam Neely Music"
+                                                  :item_count_at_enrichment 0})
+                dp/mark-pending!       (fn [_ _] {:status "pending"
+                                                  :tag_value "parent-directory:adam-neely-music"
+                                                  :item_count_at_enrichment 0})]
+    (doseq [body [{:concept_name "Adam Neely Music"}   ; CLI / OpenAI snake_case wire form
+                  {:concept-name "Adam Neely Music"}]] ; kebab-case wire form
+      (let [resp (call (handler)
+                       (json-req :post "/grout/enrich-by-tag/parent-directory:adam-neely-music" body))]
+        (is (not= 400 (:status resp))
+            (str "enrich-by-tag must accept CLI body " body))
+        (is (= 202 (:status resp)))
+        (is (= "parent-directory:adam-neely-music" (get-in resp [:body :tag])))
+        (is (= 4 (get-in resp [:body :item-count]))
+            "response body must use the kebab-case item-count key")))))
+
+(deftest enrich-by-tag-missing-concept-name-is-400
+  (with-redefs [store/count-by-tag (fn [_ _] 4)]
+    (let [resp (call (handler)
+                     (json-req :post "/grout/enrich-by-tag/parent-directory:x" {}))]
+      (is (= 400 (:status resp))))))
 
 (deftest enrich-endpoint-502-when-enrichment-fails
   (with-redefs [enrich/enrich-one! (fn [_ _ _ _] nil)

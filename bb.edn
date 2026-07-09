@@ -1,0 +1,10 @@
+;; Babashka tasks for the grout-cli script. The server test suite runs under
+;; Kaocha (`clojure -M:test`); these cover the pure logic in `bin/grout-cli.bb`,
+;; which is a babashka script and can't be loaded on the JVM/Kaocha classpath.
+{:paths ["test-bb"]
+ :tasks
+ {test {:doc "Run grout-cli babashka unit tests (Bug 1 grouping, Bug 3 tally)."
+        :requires ([clojure.test :as t])
+        :task (do (require 'grout-cli-test)
+                  (let [{:keys [fail error]} (t/run-tests 'grout-cli-test)]
+                    (System/exit (if (pos? (+ (or fail 0) (or error 0))) 1 0))))}}}

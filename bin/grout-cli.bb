@@ -44,6 +44,11 @@ Directory-upload mode (--upload-dir):
       --upload-dir=DIR   Upload every file in DIR (non-recursive), tagging each
                          with parent-directory:<normalized> + content-type:<kind>,
                          then trigger one shared directory-level enrichment.
+      --group=NAME       Grouping name the shared profile is keyed on, instead of
+                         DIR's leaf basename. Point --upload-dir at a year/subdir
+                         but pass --group='Adam Neely Music' so every subdir under
+                         a creator shares one parent-directory:adam-neely-music
+                         profile. Defaults to the leaf of --upload-dir.
       --wait             Block on the enrichment call (default: fire-and-forget)
       --threshold-pct=N  Re-enrich only if the item count grew >N% (default 20)
 
@@ -67,6 +72,7 @@ Examples:
    :name          {}
    :description   {}
    :upload-dir    {}
+   :group         {}
    :wait          {:coerce :boolean}
    :threshold-pct {}
    :no-filename-tag {:coerce :boolean}
@@ -137,6 +143,17 @@ Examples:
       (str/replace #"[^a-z0-9]+" "-")
       (str/replace #"^-+|-+$" "")))
 
+(defn grouping-concept
+  "The concept name the shared directory profile is keyed on. `--group` wins when
+   given, so that sibling subdirectories under one creator (e.g. year folders)
+   share a single profile; otherwise it falls back to the leaf basename of the
+   upload directory. Pointing --upload-dir at '.../Adam Neely Music/2024' with no
+   --group would key on '2024' — unshareable across years and colliding with any
+   other creator's year folders; `--group='Adam Neely Music'` fixes that."
+  [group dir]
+  (or (some-> group str not-empty)
+      (str (fs/file-name (fs/normalize (fs/absolutize dir))))))
+
 (defn- base-url [opts]
   (let [server (or (:server opts) (System/getenv "GROUT_URL"))]
     (when (str/blank? server)
@@ -205,15 +222,32 @@ Examples:
         (let [id (:id (:json existing))]
           (if (:dry-run opts)
             {:file file :action :would-retag :id id :status 200 :tags all-tags :hash hash}
+            ;; Already stored: add only the missing tags. `add-tag!` is
+            ;; idempotent server-side, so a re-run with the tags already present
+            ;; is a clean no-op (:unchanged), never a failure. Tag-add errors are
+            ;; reported as their own :retag-failed action, distinct from an upload
+            ;; failure, and don't abort the remaining tags for the file.
             (let [current (set (:tags (:json existing)))
-                  to-add (remove current all-tags)]
-              (doseq [tag to-add]
-                (let [resp (add-tag! server id tag verbose?)]
-                  (when-not (#{200 201} (:status resp))
-                    (throw (ex-info (str "failed to add tag " tag)
-                                    {:status (:status resp) :body (:body resp)})))))
-              {:file file :action :retagged :id id :status 200
-               :tags (vec (distinct (concat current all-tags))) :hash hash})))
+                  to-add  (remove current all-tags)
+                  failed  (vec (keep (fn [tag]
+                                       (let [resp (add-tag! server id tag verbose?)]
+                                         (when-not (#{200 201} (:status resp))
+                                           {:tag tag :status (:status resp)})))
+                                     to-add))]
+              (cond
+                (seq failed)
+                {:file file :action :retag-failed :id id :status 200 :hash hash
+                 :error (str "failed to add tag(s): "
+                             (str/join ", " (map #(str (:tag %) " (status " (:status %) ")")
+                                                 failed)))}
+
+                (seq to-add)
+                {:file file :action :retagged :id id :status 200
+                 :tags (vec (distinct (concat current all-tags))) :hash hash}
+
+                :else
+                {:file file :action :unchanged :id id :status 200
+                 :tags (vec current) :hash hash}))))
 
         (= 404 (:status existing))
         (if (:dry-run opts)
@@ -237,10 +271,26 @@ Examples:
         {:file file :error (str "unexpected by-hash status " (:status existing))}))))
 
 (defn- enrich-by-tag! [server tag concept-name opts]
-  (let [body (cond-> {:concept_name concept-name}
+  (let [body (cond-> {:concept-name concept-name}
                (:wait opts)          (assoc :wait true)
-               (:threshold-pct opts) (assoc :threshold_pct (parse-long (str (:threshold-pct opts)))))]
+               (:threshold-pct opts) (assoc :threshold-pct (parse-long (str (:threshold-pct opts)))))]
     (http-post (str server "/grout/enrich-by-tag/" tag) body (:verbose opts))))
+
+(defn classify-result
+  "Bucket a `process-file!` result for the --upload-dir tally. Truthful
+   reporting: a file is only `:failed` when it actually errored (an upload 5xx,
+   a not-found, a tag-add failure) — never merely because it was already stored.
+     :failed   — the file errored
+     :uploaded — bytes newly stored (201)
+     :retagged — an already-stored item gained >=1 tag
+     :existing — already stored and already fully tagged (a no-op), or a
+                 server-side dedup match on upload"
+  [result]
+  (cond
+    (:error result)                :failed
+    (= :uploaded (:action result)) :uploaded
+    (= :retagged (:action result)) :retagged
+    :else                          :existing))
 
 (defn- upload-dir!
   "Directory-upload mode: tag every file in the directory with
@@ -252,7 +302,7 @@ Examples:
     (when-not (fs/directory? dir)
       (binding [*out* *err*] (println (str "error: not a directory: " dir)))
       (System/exit 2))
-    (let [concept    (str (fs/file-name (fs/normalize (fs/absolutize dir))))
+    (let [concept    (grouping-concept (:group opts) dir)
           norm       (normalize-dir-name concept)
           pd-tag     (str "parent-directory:" norm)
           ct-tag     (str "content-type:" (:kind opts))
@@ -260,21 +310,17 @@ Examples:
                                             (:tag opts []) (split-tags (:tags opts)))))
           files      (->> (fs/list-dir dir) (filter fs/regular-file?) (map str) sort)
           json?      (:json opts)
-          tally      (atom {:uploaded 0 :existing 0 :failed 0})]
+          tally      (atom {:uploaded 0 :retagged 0 :existing 0 :failed 0})]
       (when (empty? files)
         (binding [*out* *err*] (println (str "error: no files in " dir)))
         (System/exit 2))
       (doseq [file files]
         (let [result (try (process-file! server opts base-tags file)
                           (catch Exception e {:file file :error (or (ex-message e) (str e))}))]
-          (swap! tally update
-                 (cond (:error result)                              :failed
-                       (#{:uploaded} (:action result))              :uploaded
-                       :else                                        :existing)
-                 inc)
+          (swap! tally update (classify-result result) inc)
           (result! json? result)))
       ;; Fire the shared enrichment for the whole directory (unless a dry run).
-      (let [{:keys [uploaded existing failed]} @tally]
+      (let [{:keys [uploaded retagged existing failed]} @tally]
         (if (:dry-run opts)
           (if json?
             (println (json/generate-string {:action "dry-run-plan" :tag pd-tag
@@ -286,10 +332,10 @@ Examples:
             (if json?
               (println (json/generate-string {:action "enrich-by-tag" :tag pd-tag
                                               :concept concept :profile-status pstatus
-                                              :uploaded uploaded :existing existing
-                                              :failed failed}))
-              (println (format "%s: uploaded=%s existing=%s failed=%s profile-status=%s tag=%s"
-                              concept uploaded existing failed pstatus pd-tag)))))
+                                              :uploaded uploaded :retagged retagged
+                                              :existing existing :failed failed}))
+              (println (format "%s: uploaded=%s retagged=%s existing=%s failed=%s profile-status=%s tag=%s"
+                              concept uploaded retagged existing failed pstatus pd-tag)))))
         (when (pos? failed) (System/exit 1))))))
 
 (defn -main [argv]
@@ -321,4 +367,6 @@ Examples:
         (when (pos? @failures)
           (System/exit 1))))))
 
-(-main *command-line-args*)
+;; Only run when executed as a script, not when loaded/required by a test.
+(when (= *file* (System/getProperty "babashka.file"))
+  (-main *command-line-args*))

@@ -51,3 +51,45 @@
     (is (thrown? clojure.lang.ExceptionInfo
                  (intake/intake! {:ds nil :media-dir "/m"}
                                  {:path "/x.mp4" :kind "bumper"})))))
+
+(deftest content-hash-insert-race-folds-into-existing
+  ;; The content_hash check-then-insert is not atomic: find-by-hash misses on
+  ;; the pre-check, a racing (or interrupted-then-retried) identical upload
+  ;; commits, and create! then trips the unique index (SQLSTATE 23505). Intake
+  ;; must treat that as a dedup (-> 200), never surface it as a 500.
+  (let [calls  (atom 0)
+        merged (atom nil)]
+    (with-redefs [hash/sha256-file     (fn [_] "dupehash")
+                  ;; miss on the pre-check (call 1), hit on the post-violation retry
+                  store/find-by-hash   (fn [_ _]
+                                         (when (> (swap! calls inc) 1)
+                                           {:id 99 :tags ["existing"] :name nil
+                                            :description nil :channel nil :superseded_at nil}))
+                  probe/normalize-to!  (fn [_ out _] {:path out
+                                                      :probe {:duration-ms 5000}
+                                                      :normalized false})
+                  store/create!        (fn [_ _]
+                                         (throw (java.sql.SQLException.
+                                                 "duplicate key value violates unique constraint"
+                                                 "23505")))
+                  store/update-fields! (fn [_ id fields] (reset! merged [id fields])
+                                         (assoc fields :id id))]
+      (let [{:keys [row deduplicated]}
+            (intake/intake! {:ds nil :media-dir "/data/media/grout"}
+                            {:path "/src/orig.mkv" :kind "bumper" :tags ["fun"]})]
+        (is (true? deduplicated) "a lost insert race is reported as a dedup, not an error")
+        (is (= 99 (:id row)))
+        (let [[id fields] @merged]
+          (is (= 99 id))
+          (is (= ["existing" "fun"] (:tags fields)) "tags unioned into the winner's row"))))))
+
+(deftest non-unique-sql-error-propagates
+  ;; Only a unique violation is swallowed as a dedup; any other DB error must
+  ;; still surface so it isn't silently misreported as a successful store.
+  (with-redefs [hash/sha256-file    (fn [_] "h")
+                store/find-by-hash  (fn [_ _] nil)
+                probe/normalize-to! (fn [_ out _] {:path out :probe {:duration-ms 1000} :normalized false})
+                store/create!       (fn [_ _] (throw (java.sql.SQLException. "connection lost" "08006")))]
+    (is (thrown? java.sql.SQLException
+                 (intake/intake! {:ds nil :media-dir "/m"}
+                                 {:path "/x.mp4" :kind "bumper"})))))
