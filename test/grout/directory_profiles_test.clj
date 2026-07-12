@@ -89,6 +89,24 @@
                 :dimensions))))
 
 (deftest ->profile-leaves-tags-alone
-  ;; `tags` is a vector of strings, not a map; `update-keys` would be a no-op
-  ;; and is intentionally not applied.
+  ;; `tags` is a vector of strings, not a map; it passes through as-is.
   (is (= ["a" "b"] (-> (dp/->profile {:dimensions {} :tags ["a" "b"]}) :tags))))
+
+;; Regression for the live 500 on `GET /grout/directory-profiles/parent-directory:2019`
+;; where the *tags* jsonb held a non-array value; the response schema
+;; `[:maybe [:vector :string]]` rejected it ({:tags ["invalid type"]}). The tags
+;; analog of the dimensions fix: `->profile` normalizes any mis-shaped tags
+;; value so the read endpoint reports it rather than 500ing.
+
+(deftest ->profile-coerces-scalar-tags-to-vector
+  (is (= ["iq2"] (-> (dp/->profile {:dimensions {} :tags "iq2"}) :tags))))
+
+(deftest ->profile-coerces-object-tags-to-nil
+  ;; A jsonb object can't be represented as tags; normalize to nil, not a 500.
+  (is (nil? (-> (dp/->profile {:dimensions {} :tags {"a" 1}}) :tags))))
+
+(deftest ->profile-drops-blank-tag-elements
+  (is (= ["a" "b"] (-> (dp/->profile {:dimensions {} :tags ["a" "" "  " "b"]}) :tags))))
+
+(deftest ->profile-preserves-nil-tags
+  (is (nil? (-> (dp/->profile {:dimensions {} :tags nil}) :tags))))

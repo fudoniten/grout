@@ -41,17 +41,46 @@
     (string? v)             (json/parse-string v true)
     :else                   v))
 
+(defn- coerce-dimensions
+  "Parse the `dimensions` JSONB column to a Clojure map and canonicalize its
+  top-level keys to keywords. jsonb round-trips object keys as strings, but the
+  OpenAPI response schema ([:map-of :keyword …]) and the worker consumers
+  expect `:channel`/`:audience`/… — a string-keyed map trips response coercion
+  (a live 500 on GET /grout/directory-profiles/<tag>). nil, and defensively any
+  non-map (mis-shaped legacy) value, become nil rather than 500."
+  [v]
+  (let [parsed (coerce-jsonb v)]
+    (when (map? parsed)
+      (update-keys parsed keyword))))
+
+(defn- coerce-tags
+  "Parse the `tags` JSONB column to a vector of strings (or nil). The normal
+  shape is a JSON array of strings, but a mis-shaped row (a scalar or object in
+  the tags column, e.g. from a hand-edited or legacy profile) must not trip the
+  [:maybe [:vector :string]] response schema and 500 the endpoint — the tags
+  analog of the dimensions coercion above. A JSON array is stringified with
+  blanks dropped; a lone scalar becomes a single-element vector; an object (not
+  representable as tags) and nil become nil."
+  [v]
+  (let [parsed (coerce-jsonb v)]
+    (cond
+      (nil? parsed)        nil
+      (sequential? parsed) (->> parsed (map str) (map str/trim) (remove str/blank?) vec)
+      (map? parsed)        nil
+      :else                (let [s (str/trim (str parsed))]
+                             (when-not (str/blank? s) [s])))))
+
 (defn ->profile
-  "Coerce a raw row map into a profile: JSONB columns parsed to Clojure data,
-  and the `dimensions` map's keys canonicalized to Clojure keywords (jsonb
-  parses to string keys, but the OpenAPI response schema and the worker
-  consumers expect `:channel`, `:audience`, etc.). `tags` is a vector of
-  strings — no key normalization needed."
+  "Coerce a raw row map into a profile: the `dimensions` and `tags` JSONB
+  columns parsed to Clojure data and normalized to the OpenAPI response shape
+  (`dimensions` as a keyword-keyed map, `tags` as a vector of strings). Both are
+  defensive against mis-shaped rows so a bad profile reports nothing rather than
+  500ing the read endpoint (see `coerce-dimensions`/`coerce-tags`)."
   [row]
   (when row
     (-> row
-        (update :dimensions #(some-> % (update-keys keyword) coerce-jsonb))
-        (update :tags coerce-jsonb))))
+        (update :dimensions coerce-dimensions)
+        (update :tags coerce-tags))))
 
 (defn- exec-one [ds sql-vec]
   (jdbc/execute-one! ds sql-vec {:builder-fn rs/as-unqualified-lower-maps}))

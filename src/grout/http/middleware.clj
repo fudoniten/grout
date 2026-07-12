@@ -11,6 +11,15 @@
 (defn- java-instant-encoder [^Instant v ^JsonGenerator gen]
   (.writeString gen (.toString v)))
 
+(defn- coercion-error-values
+  "For each malli sub-error, the path into the coerced value and the actual
+  offending value. `me/humanize` reports only *what kind* of error occurred
+  (e.g. {:tags [\"invalid type\"]}); this surfaces the value that tripped it
+  (e.g. {[:tags] \"2019\"}) so a response-coercion 500 is diagnosable from the
+  log alone instead of requiring a DB dig."
+  [errors]
+  (into {} (map (fn [{:keys [in value]}] [(vec in) value])) errors))
+
 (def muuntaja
   "JSON encoding/decoding configuration using kebab-case keyword keys."
   (m/create
@@ -50,7 +59,9 @@
             :reitit.coercion/response-coercion
             (do
               (log/error "Response coercion failed"
-                         {:uri (:uri request) :in (:in data) :errors (me/humanize data)})
+                         {:uri (:uri request) :in (:in data)
+                          :errors (me/humanize data)
+                          :values (coercion-error-values (:errors data))})
               {:status 500
                :body {:error "Internal server error"}})
 
