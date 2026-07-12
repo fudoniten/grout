@@ -45,10 +45,10 @@ Directory-upload mode (--upload-dir):
                          with parent-directory:<normalized> + content-type:<kind>,
                          then trigger one shared directory-level enrichment.
       --group=NAME       Grouping name the shared profile is keyed on, instead of
-                         DIR's leaf basename. Point --upload-dir at a year/subdir
-                         but pass --group='Adam Neely Music' so every subdir under
-                         a creator shares one parent-directory:adam-neely-music
-                         profile. Defaults to the leaf of --upload-dir.
+                         the upload dir's parent directory. Point --upload-dir at
+                         a year/subdir and pass --group='Adam Neely Music' so every
+                         subdir under a creator shares one parent-directory:adam-neely-music
+                         profile. Defaults to the parent of --upload-dir's leaf.
       --wait             Block on the enrichment call (default: fire-and-forget)
       --threshold-pct=N  Re-enrich only if the item count grew >N% (default 20)
 
@@ -144,15 +144,32 @@ Examples:
       (str/replace #"^-+|-+$" "")))
 
 (defn grouping-concept
-  "The concept name the shared directory profile is keyed on. `--group` wins when
-   given, so that sibling subdirectories under one creator (e.g. year folders)
-   share a single profile; otherwise it falls back to the leaf basename of the
-   upload directory. Pointing --upload-dir at '.../Adam Neely Music/2024' with no
-   --group would key on '2024' — unshareable across years and colliding with any
-   other creator's year folders; `--group='Adam Neely Music'` fixes that."
+  "The concept name the shared directory profile is keyed on.
+
+  `--group` wins when given, so that sibling subdirectories under one creator
+  (e.g. year folders) share a single profile even when their leaves differ.
+
+  Without `--group`, the default is the **parent** of `--upload-dir`'s leaf
+  — not the leaf itself. This matches the common case of pointing
+  `--upload-dir` at a year subdir (e.g. `.../Adam Neely Music/2024`) where
+  the leaf is a year that would otherwise be unshareable across years and
+  collide with any other creator's year folders. The parent
+  (`Adam Neely Music`) is the meaningful group label; the leaf
+  (`2024`) is just a batch boundary.
+
+  Edge cases: a path with no meaningful parent (e.g. `/Filler` — the parent
+  is the filesystem root) falls back to the leaf. Passing an explicit
+  `--group=''` is treated the same as omitting `--group`."
   [group dir]
   (or (some-> group str not-empty)
-      (str (fs/file-name (fs/normalize (fs/absolutize dir))))))
+      (let [abs    (fs/absolutize (fs/normalize dir))
+            leaf   (str (fs/file-name abs))
+            parent-dir  (str (fs/parent abs))
+            parent-leaf (str (fs/file-name (fs/parent abs)))]
+        (if (and (not= parent-dir "/")
+                 (not= parent-leaf leaf))
+          parent-leaf
+          leaf))))
 
 (defn- base-url [opts]
   (let [server (or (:server opts) (System/getenv "GROUT_URL"))]
