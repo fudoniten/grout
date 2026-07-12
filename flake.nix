@@ -36,6 +36,17 @@
           '';
         };
 
+        # Resumable bulk uploader that drives grout-cli over a content root.
+        # grout-cli is put on PATH so grout-bulk's default `--grout-cli
+        # grout-cli` resolves without extra configuration.
+        grout-bulk = pkgs.writeShellApplication {
+          name = "grout-bulk";
+          runtimeInputs = [ pkgs.babashka grout-cli ];
+          text = ''
+            exec bb ${./bin/grout-bulk.bb} "$@"
+          '';
+        };
+
         versionInfo = let
           gitCommit = self.rev or self.dirtyRev or "unknown";
           gitTimestamp = if self ? lastModified then
@@ -49,7 +60,7 @@
       in {
         packages = rec {
           default = grout;
-          inherit grout migratusRunner grout-cli;
+          inherit grout migratusRunner grout-cli grout-bulk;
 
           deployContainer = let version = versionInfo;
           in helpers.deployContainers {
@@ -159,6 +170,10 @@
           grout-cli = {
             type = "app";
             program = "${self.packages."${system}".grout-cli}/bin/grout-cli";
+          };
+          grout-bulk = {
+            type = "app";
+            program = "${self.packages."${system}".grout-bulk}/bin/grout-bulk";
           };
         };
       });

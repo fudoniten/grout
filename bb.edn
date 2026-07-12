@@ -3,8 +3,8 @@
 ;; which is a babashka script and can't be loaded on the JVM/Kaocha classpath.
 {:paths ["test-bb"]
  :tasks
- {test {:doc "Run grout-cli babashka unit tests (Bug 1 grouping, Bug 3 tally)."
+ {test {:doc "Run babashka unit tests for bin/grout-cli.bb and bin/grout-bulk.bb."
         :requires ([clojure.test :as t])
-        :task (do (require 'grout-cli-test)
-                  (let [{:keys [fail error]} (t/run-tests 'grout-cli-test)]
+        :task (do (require 'grout-cli-test 'grout-bulk-test)
+                  (let [{:keys [fail error]} (t/run-tests 'grout-cli-test 'grout-bulk-test)]
                     (System/exit (if (pos? (+ (or fail 0) (or error 0))) 1 0))))}}}

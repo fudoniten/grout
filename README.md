@@ -94,6 +94,45 @@ for the full option list (`--kind`, `--channel`, `--source`, `--source-url`,
 `--name`, `--description`, `--no-filename-tag`, `--dry-run`, `--json`,
 `--verbose`).
 
+## Bulk uploads (`grout-bulk`)
+
+`grout-bulk` is a resumable, trackable driver around `grout-cli` for uploading a
+large collection — hundreds of thousands of files — a directory at a time. It's
+built by the flake as `grout-bulk` (and bundled into the `kube-util` image,
+which mounts the media filesystem). It walks a content root, and for **every
+directory that directly contains files** it runs
+`grout-cli --upload-dir <dir> --json`, capturing the per-file JSON as a
+per-directory manifest and recording per-directory progress in a JSON state
+file. A crash, kill, or pod eviction resumes without redoing finished work: a
+directory already marked `done` is skipped entirely, so **its files are never
+re-hashed**. Path is treated as identity — nothing re-reads bytes to decide
+whether a directory is already uploaded.
+
+Because `grout-cli --upload-dir` is non-recursive and keys its shared enrichment
+profile on the *parent* of each leaf, the common pinchflat layout
+(`Content/<Creator>/<Year>/<files>`) maps cleanly: one upload unit per year
+folder, one shared `parent-directory:<creator>` profile. Point `--root` at a
+single creator or at all of `Content/` — discovery handles both.
+
+```sh
+# Upload a creator's tree, 4 directories in flight, state on a persistent mount
+grout-bulk run -r '/pinchflat-media/Content/Adam Neely' -s http://grout:8080 \
+  -d /mnt/grout-bulk -j 4
+
+grout-bulk status -r '/pinchflat-media/Content/Adam Neely' -d /mnt/grout-bulk
+grout-bulk retry  -r '/pinchflat-media/Content/Adam Neely' -d /mnt/grout-bulk -j 4
+grout-bulk --help
+```
+
+Commands: `run` (resumes; skips `done`, re-runs crashed `in_progress`), `retry`
+(re-runs only `failed` directories, e.g. after a Grout outage), `status`
+(counts + per-directory table; `--json` for `jq`), `reset` (drop a root's state
+file — logs and grout-cli's by-hash dedup remain the safety net). Anything after
+`--` is forwarded verbatim to every `grout-cli` call
+(`grout-bulk run -r … -- --kind=filler --tag=music`). The server comes from
+`-s`/`--server` or `$GROUT_URL`; keep `--state-dir` on a persistent volume,
+since the container filesystem is not. See `grout-bulk --help` for all options.
+
 ## Running
 
 ```sh
