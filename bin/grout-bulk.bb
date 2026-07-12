@@ -71,7 +71,8 @@ Options:
   -h, --help             Show this help.
 
 Anything after `--` is forwarded verbatim to every grout-cli invocation, e.g.
-extra tags, --kind, --channel, --group, --wait, --threshold-pct:
+extra tags, --kind, --channel, --group, --threshold-pct. Note: grout-bulk
+always passes --no-wait itself; you don't need to (and shouldn't) --wait.
 
   grout-bulk run -r '/pinchflat-media/Content/Adam Neely' -s http://grout:8080 \\
     -d /mnt/grout-bulk -j 4 -- --kind=filler --tag=music
@@ -287,7 +288,14 @@ enrichment profile on the creator (the parent of each year leaf).
   (let [manifest (str (fs/path logs-dir (str (slugify unit-key*) ".jsonl")))
         errlog   (str (fs/path logs-dir (str (slugify unit-key*) ".log")))
         started  (now-iso)
-        base     (cond-> [grout-cli "--upload-dir" dir "--json"]
+        ;; --no-wait: hand the per-directory enrichment to grout-cli's
+        ;; background `future` and let the bulk dispatcher keep moving.
+        ;; Without this, each --upload-dir call blocks for ~5-10 minutes
+        ;; on the LLM enrichment response, and a 200-file run becomes
+        ;; ~10 hours of wall clock just waiting. The Grout-side enrichment
+        ;; worker still runs the LLM call to completion; --no-wait is just
+        ;; a "don't make grout-cli wait for the response" hint.
+        base     (cond-> [grout-cli "--upload-dir" dir "--json" "--no-wait"]
                    server (conj "--server" server))
         argv     (into base cli-extra)]
     (fs/create-dirs logs-dir)

@@ -49,7 +49,20 @@ Directory-upload mode (--upload-dir):
                          a year/subdir and pass --group='Adam Neely Music' so every
                          subdir under a creator shares one parent-directory:adam-neely-music
                          profile. Defaults to the parent of --upload-dir's leaf.
-      --wait             Block on the enrichment call (default: fire-and-forget)
+      --wait             Block on the enrichment call. By default --wait is
+                         off: the CLI fires the shared directory-level enrichment
+                         as a background `future` and exits as soon as the per-file
+                         uploads complete, so a 200-file run is bounded by
+                         hashing+I/O rather than by the LLM. Pass --wait to make
+                         the CLI block until the enrichment response returns
+                         (use this when the caller needs the profile-status, e.g.
+                         integration tests).
+      --no-wait          Like the default: fire the shared directory-level
+                         enrichment as a background `future` and exit. The
+                         Grout-side enrichment worker still runs to completion
+                         asynchronously; --no-wait is just the explicit form.
+                         (Provided for symmetry with --wait and for callers
+                         scripting the bulk path.)
       --threshold-pct=N  Re-enrich only if the item count grew >N% (default 20)
       --manifest=PATH    JSONL cache of (path,size,mtime) -> sha256. Looked up before
                          hashing a file (cache hit skips sha256-file) and appended
@@ -80,6 +93,7 @@ Examples:
    :upload-dir    {}
    :group         {}
    :wait          {:coerce :boolean}
+   :no-wait       {:coerce :boolean}
    :threshold-pct {}
    :manifest      {}
    :no-filename-tag {:coerce :boolean}
@@ -468,6 +482,17 @@ Examples:
               (flush-manifest! cache manifest file))
             (result! json? result))))
       ;; Fire the shared enrichment for the whole directory (unless a dry run).
+      ;;
+      ;; --wait (legacy): block on the enrichment response. Use when the caller
+      ;; needs the synchronous profile-status (e.g. integration tests, the
+      ;; grout-bulk smoke test where a human is watching).
+      ;;
+      ;; --no-wait / default: kick the enrichment into a background `future`
+      ;; and exit as soon as the per-file uploads complete. The Grout-side
+      ;; enrichment worker still runs the LLM call to completion; we just
+      ;; don't wait for it. This is what the bulk run wants — without it,
+      ;; a 200-file run is bounded by the LLM (~5-10s of compute per file
+      ;; + wait), not by hashing+I/O.
       (let [{:keys [uploaded retagged existing failed]} @tally]
         (if (:dry-run opts)
           (if json?
@@ -475,15 +500,28 @@ Examples:
                                              :concept concept :files (count files)}))
             (println (format "dry-run: would enrich %s (%s files) as tag %s"
                              concept (count files) pd-tag)))
-          (let [resp    (enrich-by-tag! server pd-tag concept opts)
-                pstatus (get-in resp [:json :status] "unknown")]
+          (let [enrich! (fn []
+                          (let [resp    (enrich-by-tag! server pd-tag concept opts)
+                                pstatus (get-in resp [:json :status] "unknown")]
+                            (when (:verbose opts)
+                              (binding [*out* *err*]
+                                (println (format "enrich-by-tag %s -> %s" pd-tag pstatus))))
+                            pstatus))
+                pstatus (if (:wait opts)
+                          (enrich!))] ; blocking — return value is the status
+            ;; Fire-and-forget path. Discard the future; bb will reap it on exit.
+            (when-not (:wait opts)
+              (future (try (enrich!) (catch Exception e
+                                       (binding [*out* *err*]
+                                         (println (str "background enrich failed: "
+                                                       (ex-message e))))))))
             (if json?
               (println (json/generate-string {:action "enrich-by-tag" :tag pd-tag
-                                              :concept concept :profile-status pstatus
+                                              :concept concept :profile-status (or pstatus "pending")
                                               :uploaded uploaded :retagged retagged
                                               :existing existing :failed failed}))
               (println (format "%s: uploaded=%s retagged=%s existing=%s failed=%s profile-status=%s tag=%s"
-                              concept uploaded retagged existing failed pstatus pd-tag)))))
+                              concept uploaded retagged existing failed (or pstatus "pending") pd-tag)))))
         (when (pos? failed) (System/exit 1))))))
 
 (defn -main [argv]
