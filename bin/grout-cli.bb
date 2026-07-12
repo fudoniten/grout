@@ -51,6 +51,12 @@ Directory-upload mode (--upload-dir):
                          profile. Defaults to the parent of --upload-dir's leaf.
       --wait             Block on the enrichment call (default: fire-and-forget)
       --threshold-pct=N  Re-enrich only if the item count grew >N% (default 20)
+      --manifest=PATH    JSONL cache of (path,size,mtime) -> sha256. Looked up before
+                         hashing a file (cache hit skips sha256-file) and appended
+                         after each successful process. Resumable across runs: a
+                         re-run only re-hashes files whose size or mtime changed.
+                         If PATH is unwritable, the CLI logs a warning and proceeds
+                         without caching (no upload is lost).
 
 By default every file also gets a `filename:<basename>` tag, so the original
 filename is always searchable even after enrichment renames it.
@@ -75,6 +81,7 @@ Examples:
    :group         {}
    :wait          {:coerce :boolean}
    :threshold-pct {}
+   :manifest      {}
    :no-filename-tag {:coerce :boolean}
    :dry-run       {:coerce :boolean}
    :json          {:coerce :boolean}
@@ -124,6 +131,126 @@ Examples:
             (.update md buf 0 n)
             (recur)))))
     (apply str (map #(format "%02x" (bit-and (int %) 0xff)) (.digest md)))))
+
+;; --- Manifest cache: (path, size, mtime) -> sha256 ------------------------
+;;
+;; Backed by a JSONL file. The cache key is the triple `(path, size, mtime)`;
+;; any change to size or mtime invalidates the entry and forces a re-hash.
+;; Path is the absolute (canonical) filesystem path — `fs/absolutize` resolves
+;; `.` and `..` and removes the trailing-slash difference.
+;;
+;; The cache is append-only on the success path: a row is written only after
+;; `process-file!` returns a non-error result. A mid-run crash (or a row that
+;; the CLI couldn't even hash) leaves the manifest in its prior valid state,
+;; so a resume picks up the unfinished file cleanly.
+;;
+;; Concurrent CLI invocations writing the same manifest are not safe — the
+;; bulk wrapper (or the user) is expected to serialise. Each line is
+;; self-contained JSON, so a torn write corrupts at most one row.
+;;
+;; `load-manifest!` and `cache-hash!` are best-effort: if the file is missing,
+;; empty, or malformed, the cache starts empty and writes are skipped with a
+;; warning. The CLI never fails an upload because of a manifest problem.
+
+(defn- manifest-key
+  "Build the (path, size, mtime) cache key for `path`. Uses
+   `fs/absolutize` so 'foo/' and 'foo' map to the same row. Missing
+   stat info (e.g. file deleted between walk and process) yields
+   a sentinel of -1 / -1, which will never match a real cache hit and
+   therefore forces a re-hash."
+  [path]
+  (let [abs (str (fs/absolutize path))
+        f   (java.io.File. (str path))
+        sz  (try (.length f) (catch Exception _ -1))
+        mt  (try (long (/ (.lastModified f) 1000)) (catch Exception _ -1))]
+    [abs sz mt]))
+
+(defn- manifest-path-open
+  "Open `path` for append. Returns a java.io.BufferedWriter, or nil if the
+   file can't be opened for write (caller treats that as 'no manifest')."
+  [path]
+  (try
+    (let [f (fs/file path)]
+      (when-let [parent (fs/parent f)]
+        (fs/create-dirs parent))
+      (clojure.java.io/writer f :append true))
+    (catch Exception _ nil)))
+
+(defn- manifest-line
+  "Render a manifest row as a single JSONL line. Returns the string with
+   a trailing newline, or nil if any field is missing/blank."
+  [path size mtime hash]
+  (let [row {:path path :size size :mtime mtime :hash hash}]
+    (when (and path size mtime hash (not (str/blank? path)) (not (str/blank? hash)))
+      (str (json/generate-string row) "\n"))))
+
+(defn load-manifest!
+  "Read the JSONL manifest at `path` (if any) into an atom holding a
+   `{[abs-path size mtime] hash}` map. Lines that fail to parse are skipped
+   with a stderr warning — the cache never throws on bad input.
+
+   Returns the atom. Returns an empty atom if `path` is nil/blank, the file
+   is missing, or every line was malformed."
+  [path]
+  (let [cache (atom {})]
+    (when (and path (not (str/blank? path)) (fs/exists? path))
+      (try
+        (with-open [rdr (clojure.java.io/reader path)]
+          (doseq [line (line-seq rdr)]
+            (let [trimmed (str/trim line)]
+              (when (seq trimmed)
+                (try
+                  (let [row (json/parse-string trimmed true)
+                        k [(str (fs/absolutize (:path row))) (:size row) (:mtime row)]]
+                    (swap! cache assoc k (:hash row)))
+                  (catch Exception e
+                    (binding [*out* *err*]
+                      (println (str "warning: skipping malformed manifest line: "
+                                    (or (ex-message e) (str e)))))))))))
+        (catch Exception e
+          (binding [*out* *err*]
+            (println (str "warning: failed to read manifest " path ": "
+                          (or (ex-message e) (str e))))))))
+    cache))
+
+(defn- file-hash
+  "Look up `path`'s sha256 in `cache`. If found, return the cached hash.
+   If not, compute it with `sha256-file` and remember the result in `cache`
+   for the rest of this run. The manifest row is flushed via `flush-manifest!`
+   only after the surrounding process-file! succeeds, so a failed file isn't
+   cached on disk."
+  [cache path]
+  (let [k (manifest-key path)]
+    (if-let [cached (get @cache k)]
+      cached
+      (let [h (sha256-file path)]
+        (swap! cache assoc k h)
+        h))))
+
+;; --- end manifest cache -----------------------------------------------------
+
+(defn- flush-manifest!
+  "Append the (path, size, mtime, hash) row for `path` (per `cache`) to the
+   JSONL file at `manifest-path`. No-op if `manifest-path` is nil/blank
+   or the file isn't writable. Returns true on success, false otherwise.
+   The in-memory cache is updated either way; only the on-disk row is
+   best-effort."
+  [cache manifest-path path]
+  (when (and manifest-path (not (str/blank? manifest-path)))
+    (let [k (manifest-key path)
+          [abs sz mt] k
+          hash (get @cache k)]
+      (when hash
+        (try
+          (let [line (manifest-line abs sz mt hash)]
+            (when-let [w (manifest-path-open manifest-path)]
+              (try (.write w line) (.flush w) true
+                   (finally (.close w)))))
+          (catch Exception e
+            (binding [*out* *err*]
+              (println (str "warning: failed to write manifest row for "
+                            abs ": " (or (ex-message e) (str e)))))
+            false))))))
 
 (defn- split-tags [s]
   (when (some? s)
@@ -225,13 +352,13 @@ Examples:
                       " status=" status
                       " tags=" (str/join "," tags)))))))
 
-(defn- process-file! [server opts tags file]
+(defn- process-file! [server opts tags cache file]
   (if-not (fs/exists? file)
     {:file file :error "file not found"}
     (let [filename-tag (str "filename:" (fs/file-name file))
           all-tags (vec (distinct (cond-> tags
                                      (not (:no-filename-tag opts)) (conj filename-tag))))
-          hash (sha256-file file)
+          hash (file-hash cache file)
           verbose? (:verbose opts)
           existing (by-hash server hash verbose?)]
       (cond
@@ -331,11 +458,15 @@ Examples:
       (when (empty? files)
         (binding [*out* *err*] (println (str "error: no files in " dir)))
         (System/exit 2))
-      (doseq [file files]
-        (let [result (try (process-file! server opts base-tags file)
-                          (catch Exception e {:file file :error (or (ex-message e) (str e))}))]
-          (swap! tally update (classify-result result) inc)
-          (result! json? result)))
+      (let [cache    (load-manifest! (:manifest opts))
+            manifest (:manifest opts)]
+        (doseq [file files]
+          (let [result (try (process-file! server opts base-tags cache file)
+                            (catch Exception e {:file file :error (or (ex-message e) (str e))}))]
+            (swap! tally update (classify-result result) inc)
+            (when-not (:error result)
+              (flush-manifest! cache manifest file))
+            (result! json? result))))
       ;; Fire the shared enrichment for the whole directory (unless a dry run).
       (let [{:keys [uploaded retagged existing failed]} @tally]
         (if (:dry-run opts)
@@ -373,13 +504,17 @@ Examples:
       :else
       (let [server (base-url opts)
             tags (vec (distinct (concat (:tag opts []) (split-tags (:tags opts)))))
-            failures (atom 0)]
+            failures (atom 0)
+            cache (load-manifest! (:manifest opts))
+            manifest (:manifest opts)]
         (doseq [file files]
           (let [result (try
-                         (process-file! server opts tags file)
+                         (process-file! server opts tags cache file)
                          (catch Exception e
                            {:file file :error (or (ex-message e) (str e))}))]
             (when (:error result) (swap! failures inc))
+            (when-not (:error result)
+              (flush-manifest! cache manifest file))
             (result! (:json opts) result)))
         (when (pos? @failures)
           (System/exit 1))))))
