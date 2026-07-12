@@ -29,7 +29,7 @@
                   dp/mark-ready!                (fn [_ tag dims tags cnt]
                                                   (reset! ready {:tag tag :dims dims :tags tags :cnt cnt})
                                                   {:status "ready"})]
-      (let [res (dworker/enrich-profile-one! :ds :tb 5 "parent-directory:x")]
+      (let [res (dworker/enrich-profile-one! :ds :tb {} 5 "parent-directory:x")]
         (is (= "ready" (:status res)))
         (is (= "parent-directory:x" (:tag @applied)))
         (is (= "muse" (:channel @applied)))
@@ -37,6 +37,32 @@
         (is (= [] (:stale @applied)) "no prior profile => nothing stale")
         (is (= {:channel ["muse"]} (:dims @ready)))
         (is (= 3 (:cnt @ready)))))))
+
+(deftest enrich-one-drops-hallucinated-channel-before-fanout
+  ;; The model invents a channel outside the configured vocabulary. It must
+  ;; not become a tag or set the row's channel column.
+  (let [applied (atom nil)
+        ready   (atom nil)
+        dim-config {:channel {:description "c" :values ["muse"]}}]
+    (with-redefs [dp/get-profile-for-tag        (fn [_ _] {:concept_name "C"
+                                                           :dimensions nil :tags nil :status "pending"})
+                  store/sample-filenames-by-tag (fn [_ _ _] ["a.mp4"])
+                  tb/request-enrich-profile!    (fn [& _] {:dimensions {:channel ["muse" "madeup"]}
+                                                           :tags ["jazz"] :warnings []})
+                  store/apply-directory-profile! (fn [_ tag new-tags stale channel]
+                                                   (reset! applied {:tag tag :new-tags new-tags
+                                                                    :stale stale :channel channel})
+                                                   1)
+                  store/count-by-tag            (fn [_ _] 1)
+                  dp/mark-ready!                (fn [_ _ dims tags _]
+                                                  (reset! ready {:dims dims :tags tags})
+                                                  {:status "ready"})]
+      (dworker/enrich-profile-one! :ds :tb dim-config 5 "t")
+      (is (= "muse" (:channel @applied)) "channel column set only from the valid value")
+      (is (= #{"channel:muse" "jazz"} (set (:new-tags @applied)))
+          "hallucinated 'channel:madeup' never becomes a tag")
+      (is (= {:channel ["muse"]} (:dims @ready))
+          "persisted profile stores only the valid dimension value"))))
 
 (deftest enrich-one-computes-stale-tags-on-reenrich
   ;; Old profile had audience:kids + cartoon; new profile drops them. Those
@@ -53,7 +79,7 @@
                                                    1)
                   store/count-by-tag            (fn [_ _] 1)
                   dp/mark-ready!                (fn [& _] {:status "ready"})]
-      (dworker/enrich-profile-one! :ds :tb 5 "t")
+      (dworker/enrich-profile-one! :ds :tb {} 5 "t")
       (is (= #{"channel:muse" "music"} (set (:new-tags @applied))))
       (is (= #{"audience:kids" "cartoon"} (set (:stale @applied)))))))
 
@@ -64,7 +90,7 @@
                   store/apply-directory-profile! (fn [& _] (reset! applied? true) 0)
                   dp/mark-failed!               (fn [_ tag msg] (reset! failed {:tag tag :msg msg})
                                                   {:status "failed"})]
-      (dworker/enrich-profile-one! :ds :tb 5 "t")
+      (dworker/enrich-profile-one! :ds :tb {} 5 "t")
       (is (false? @applied?) "no fan-out when there are no filenames to ground on")
       (is (= "t" (:tag @failed)))
       (is (re-find #"no sample filenames" (:msg @failed))))))
@@ -76,7 +102,7 @@
                   tb/request-enrich-profile!    (fn [& _] {:dimensions {} :tags [] :warnings []})
                   store/apply-directory-profile! (fn [& _] (reset! applied? true) 0)
                   dp/mark-failed!               (fn [_ _ msg] (reset! failed msg) {:status "failed"})]
-      (dworker/enrich-profile-one! :ds :tb 5 "t")
+      (dworker/enrich-profile-one! :ds :tb {} 5 "t")
       (is (false? @applied?))
       (is (re-find #"no dimensions or tags" @failed)))))
 
@@ -86,18 +112,18 @@
                   store/sample-filenames-by-tag (fn [_ _ _] ["a.mp4"])
                   tb/request-enrich-profile!    (fn [& _] (throw (ex-info "boom" {})))
                   dp/mark-failed!               (fn [_ _ msg] (reset! failed msg) {:status "failed"})]
-      (dworker/enrich-profile-one! :ds :tb 5 "t")
+      (dworker/enrich-profile-one! :ds :tb {} 5 "t")
       (is (= "boom" @failed)))))
 
 (deftest enrich-one-nil-when-no-profile
   (with-redefs [dp/get-profile-for-tag (fn [_ _] nil)]
-    (is (nil? (dworker/enrich-profile-one! :ds :tb 5 "missing")))))
+    (is (nil? (dworker/enrich-profile-one! :ds :tb {} 5 "missing")))))
 
 (deftest run-once-processes-pending-and-retry-ready
   (let [processed (atom [])]
     (with-redefs [dp/pending-profiles               (fn [_ _] [{:tag_value "t1"}])
                   dp/failed-profiles-ready-for-retry (fn [_ _] [{:tag_value "t2"}])
-                  dworker/enrich-profile-one!        (fn [_ _ _ tag] (swap! processed conj tag)
+                  dworker/enrich-profile-one!        (fn [_ _ _ _ tag] (swap! processed conj tag)
                                                        {:status "ready"})]
-      (is (= 2 (dworker/run-once! :ds :tb 5 10)))
+      (is (= 2 (dworker/run-once! :ds :tb {} 5 10)))
       (is (= ["t1" "t2"] @processed)))))

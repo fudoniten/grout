@@ -235,3 +235,44 @@
     (is (nil? (enrich/enrich-one! nil nil
                                   {:audience {:description "A" :values ["kids"]}}
                                   (java.util.UUID/randomUUID))))))
+
+;; --- dimension-value validation --------------------------------------------
+;;
+;; The model is told the allowed values (dim-config is the /categorize
+;; `categories` map), but it still occasionally invents a channel or
+;; audience. enrich-one! drops any dimension value outside the configured
+;; vocabulary before it becomes a tag.
+
+(deftest enrich-one-drops-hallucinated-dimension-values
+  (let [row   (atom {:id (java.util.UUID/randomUUID)
+                     :name "x" :description nil :tags [] :enrichment_context nil})
+        saved (atom nil)]
+    (with-redefs [store/find-by-id    (fn [_ _ & _] @row)
+                  store/set-enriched! (fn [_ _ data] (reset! saved data)
+                                        (swap! row assoc :enriched true) @row)
+                  tb/request-enrich-short-form!
+                  (fn [_ _ _ _ & _]
+                    {:dimensions [{:dimension "channel"  :values ["goldenreels" "madeup"]}
+                                  {:dimension "audience" :values ["kids"]}]
+                     :tags ["real-tag"]
+                     :context nil :describe nil :media nil :cost_estimate nil :warnings []})]
+      (enrich/enrich-one! nil nil
+                          {:channel  {:description "c" :values ["goldenreels"]}
+                           :audience {:description "a" :values ["kids"]}}
+                          (:id @row))
+      (is (= ["channel:goldenreels" "audience:kids" "real-tag"] (:tags @saved))
+          "the invented 'madeup' channel is dropped; valid dimension tags and free tags remain"))))
+
+(deftest enrich-one-returns-nil-when-only-hallucinated-dimensions
+  (let [row {:id (java.util.UUID/randomUUID) :name "x" :description nil :tags []}]
+    (with-redefs [store/find-by-id    (fn [_ _ & _] row)
+                  store/set-enriched! (fn [& _] (throw (ex-info "should not persist" {})))
+                  tb/request-enrich-short-form!
+                  (fn [_ _ _ _ & _]
+                    {:dimensions [{:dimension "channel" :values ["madeup"]}]
+                     :tags []
+                     :context nil :describe nil :media nil :cost_estimate nil :warnings []})]
+      (is (nil? (enrich/enrich-one! nil nil
+                                    {:channel {:description "c" :values ["goldenreels"]}}
+                                    (:id row)))
+          "all dimensions hallucinated + no free tags → nothing new → row stays enriched=false for retry"))))

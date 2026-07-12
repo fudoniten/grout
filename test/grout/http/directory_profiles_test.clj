@@ -70,7 +70,7 @@
                   store/count-by-tag     (fn [_ _] 20)
                   dp/get-profile-for-tag (fn [_ _] {:status "ready" :tag_value "parent-directory:x"
                                                     :item_count_at_enrichment 10})
-                  dworker/enrich-profile-one! (fn [_ _ _ _]
+                  dworker/enrich-profile-one! (fn [_ _ _ _ _]
                                                 (reset! enriched true)
                                                 {:status "ready" :tag_value "parent-directory:x"
                                                  :dimensions {:channel ["muse"]} :tags ["x"]

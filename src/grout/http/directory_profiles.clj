@@ -41,7 +41,7 @@
      * otherwise flips it to `pending` (worker enriches on its next tick) and
        returns 202 — or, when `wait=true`, enriches inline (bounded by a 30s
        timeout) and returns the result."
-  [{:keys [ds tunabrain sample-count]}]
+  [{:keys [ds tunabrain dim-config sample-count]}]
   (fn [{{{:keys [tag]} :path body :body} :parameters}]
     (let [{:keys [wait force threshold-pct concept-name]} body
           threshold (or threshold-pct default-threshold-pct)
@@ -66,7 +66,7 @@
                   ;; Enrich now, blocking, with a hard timeout so the CLI never
                   ;; hangs on a slow LLM; the inline future finishes regardless.
                   wait
-                  (let [fut     (future (dworker/enrich-profile-one! ds tunabrain sc tag))
+                  (let [fut     (future (dworker/enrich-profile-one! ds tunabrain dim-config sc tag))
                         result  (deref fut wait-timeout-ms ::timeout)]
                     (if (= result ::timeout)
                       {:status 202 :body (profile->body (dp/get-profile-for-tag ds tag)

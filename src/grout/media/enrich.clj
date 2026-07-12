@@ -19,6 +19,7 @@
   existing value is empty. Tags are unioned (existing + AI), never
   dropped. See `merge-enrichment` for the full contract."
   (:require [clojure.string :as str]
+            [grout.dimensions :as dim]
             [grout.media.store :as store]
             [grout.tunabrain :as tb]
             [taoensso.timbre :as log]))
@@ -119,15 +120,27 @@
   (when-let [row (store/find-by-id ds id {:include-superseded? true})]
     (let [ctx (with-existing-context row)]
       (try
-        (let [resp (tb/request-enrich-short-form! tunabrain row dim-config
-                                                  (:tags row)
-                                                  :context ctx)
+        (let [raw-resp (tb/request-enrich-short-form! tunabrain row dim-config
+                                                      (:tags row)
+                                                      :context ctx)
+              ;; Sanity-check dimension values against the controlled
+              ;; vocabulary fetched from Tunarr Scheduler before they
+              ;; become tags. The model is told the allowed values on
+              ;; the way out (dim-config is the /categorize `categories`
+              ;; map), but it still occasionally invents a channel or
+              ;; audience; drop those here so a hallucinated value never
+              ;; lands in the row's tags.
+              {valid-dims :dimensions rejected :rejected}
+              (dim/filter-selections dim-config (:dimensions raw-resp))
+              _    (dim/log-rejected! rejected {:id id})
+              resp (assoc raw-resp :dimensions valid-dims)
               merged   (merge-enrichment row resp)
               ;; Only flip enriched=true if the AI actually contributed
-              ;; something (a dimension or a new tag). If the model
-              ;; returned nothing, the row stays enriched=false so a
-              ;; later sweep can retry.
-              nothing-new? (and (empty? (:dimensions resp))
+              ;; something (a valid dimension or a new tag). If the model
+              ;; returned nothing — or only hallucinated dimensions and no
+              ;; tags — the row stays enriched=false so a later sweep can
+              ;; retry.
+              nothing-new? (and (empty? valid-dims)
                                 (empty? (:tags resp)))]
           (if nothing-new?
             (do (log/warn "No enrichment produced; leaving enriched=false"

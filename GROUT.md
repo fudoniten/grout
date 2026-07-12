@@ -175,6 +175,22 @@ For each incoming file (already on the arr-data mount):
   descriptions; Grout ships those in its own config
   (`resources/config.edn` `:dimension-descriptions`).
 
+- **Dimension values are validated against that catalog on the way
+  back in.** Telling the model the allowed values doesn't guarantee it
+  stays inside them — it still occasionally invents a channel or
+  audience (a typo like `spectum` for `spectrum`, or a fabricated
+  value). `grout.dimensions` is the guard: any dimension value returned
+  by Tunabrain that is not in the Tunarr Scheduler vocabulary is dropped
+  before it becomes a `dim:value` tag or sets a row's `channel`, and the
+  drop is logged. This applies to both enrichment paths — per-file
+  (`/enrich/short-form`) and directory (`/enrich/profile`). A dimension
+  with no configured vocabulary passes through untouched (we can't judge
+  values we have no vocabulary for), so an empty catalog (Tunarr
+  Scheduler unreachable) disables the check rather than dropping
+  everything. This mirrors Tunarr Scheduler's own
+  `curation.dimensions` guard — the two services share the vocabulary,
+  so Grout is the second line of defence on the same rule.
+
 - **Tunabrain has no generic chat-completions endpoint.** Per design
   decision (2026-07-07), Grout does NOT use the OpenAI
   `/v1/chat/completions` shape. All Grout → Tunabrain traffic is

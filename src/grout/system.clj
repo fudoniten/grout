@@ -80,10 +80,13 @@
    ;; Directory-level enrichment worker: sweeps directory_profiles and fans a
    ;; shared profile out to every child row. Uses the bare Tunabrain client
    ;; (not the per-file orchestrator map) — it calls /enrich/profile directly.
+   ;; It also takes the live dimension catalog so it can validate the model's
+   ;; dimension values against the Tunarr Scheduler vocabulary before fan-out.
    :grout/directory-worker (-> (merge {:enabled true :interval-ms 60000 :batch-size 10 :sample-count 5}
                                       directory-enrichment
                                       {:db (ig/ref :grout/db)
-                                       :tunabrain (ig/ref :grout/tunabrain)})
+                                       :tunabrain (ig/ref :grout/tunabrain)
+                                       :dim-catalog (ig/ref :grout/dim-catalog)})
                                (update :enabled parse-bool))
    :grout/retention-job (-> (merge {:enabled true :interval-ms 3600000 :cap 20 :bucket-ms 5000}
                                    retention
@@ -178,10 +181,14 @@
 (defmethod ig/halt-key! :grout/enrichment-worker [_ w]
   (worker/stop! w))
 
-(defmethod ig/init-key :grout/directory-worker [_ {:keys [db] :as cfg}]
+(defmethod ig/init-key :grout/directory-worker [_ {:keys [db dim-catalog] :as cfg}]
   ;; cfg already carries :tunabrain (the bare client, via the :grout/tunabrain
-  ;; ref) and the interval/batch/sample-count knobs; just supply :ds.
-  (directory-worker/start! (assoc cfg :ds db)))
+  ;; ref) and the interval/batch/sample-count knobs; supply :ds and build the
+  ;; :dim-config used to validate the model's dimension values (same catalog
+  ;; the per-file orchestrator uses).
+  (directory-worker/start! (assoc cfg
+                                  :ds db
+                                  :dim-config (build-dim-config dim-catalog))))
 
 (defmethod ig/halt-key! :grout/directory-worker [_ w]
   (directory-worker/stop! w))

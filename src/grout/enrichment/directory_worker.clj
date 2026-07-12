@@ -8,7 +8,8 @@
    rows (see `grout.media.store/unenriched`), so the two never process the same
    media. One LLM call here classifies a whole directory; the per-file sweeper
    still handles ad-hoc, non-directory uploads."
-  (:require [grout.directory-profiles :as dp]
+  (:require [grout.dimensions :as dim]
+            [grout.directory-profiles :as dp]
             [grout.media.store :as store]
             [grout.tunabrain :as tb]
             [taoensso.timbre :as log])
@@ -22,9 +23,14 @@
    the profile `ready`. Any failure (no samples, empty result, Tunabrain error)
    marks the profile `failed` with backoff so a later sweep retries.
 
-   The `tunabrain` arg is the bare `TunabrainClient`. Returns the profile row as
-   left in the DB (`ready` or `failed`), or nil if no profile exists for the tag."
-  [ds tunabrain sample-count tag-value]
+   The `tunabrain` arg is the bare `TunabrainClient`. `dim-config` is the
+   controlled vocabulary fetched from Tunarr Scheduler; the model's dimension
+   values are validated against it (see `grout.dimensions/filter-dimension-map`)
+   before they become tags or set a row's `channel`, so a hallucinated channel
+   or audience never fans out to the group. An empty `dim-config` disables the
+   check (every dimension passes through). Returns the profile row as left in
+   the DB (`ready` or `failed`), or nil if no profile exists for the tag."
+  [ds tunabrain dim-config sample-count tag-value]
   (when-let [profile (dp/get-profile-for-tag ds tag-value)]
     (try
       (let [samples (store/sample-filenames-by-tag ds tag-value sample-count)]
@@ -34,7 +40,9 @@
               (dp/mark-failed! ds tag-value "no sample filenames available for tag"))
           (let [resp        (tb/request-enrich-profile! tunabrain (:concept_name profile)
                                                         samples :sample-count sample-count)
-                dimensions  (:dimensions resp)
+                {dimensions :dimensions rejected :rejected}
+                (dim/filter-dimension-map dim-config (:dimensions resp))
+                _           (dim/log-rejected! rejected {:tag tag-value})
                 free-tags   (:tags resp)
                 new-tags    (dp/profile->tags dimensions free-tags)]
             (if (empty? new-tags)
@@ -56,29 +64,31 @@
 
 (defn run-once!
   "Enrich up to `batch-size` pending profiles plus any retry-ready failed ones.
-   Returns the number of profiles attempted."
-  [ds tunabrain sample-count batch-size]
+   Returns the number of profiles attempted. `dim-config` is threaded to
+   `enrich-profile-one!` for dimension-value validation."
+  [ds tunabrain dim-config sample-count batch-size]
   (let [profiles (into (dp/pending-profiles ds batch-size)
                        (dp/failed-profiles-ready-for-retry ds batch-size))]
     (when (seq profiles)
       (log/info "Directory-enrichment sweep" {:profiles (count profiles)})
       (doseq [{:keys [tag_value]} profiles]
-        (try (enrich-profile-one! ds tunabrain sample-count tag_value)
+        (try (enrich-profile-one! ds tunabrain dim-config sample-count tag_value)
              (catch Exception e
                (log/warn e "Directory enrichment sweep item failed" {:tag tag_value})))))
     (count profiles)))
 
 (defn start!
   "Start the periodic directory-enrichment worker. Returns a component map for
-   stop!. Set :enabled false to run a no-op (tests/dev)."
-  [{:keys [ds tunabrain sample-count interval-ms batch-size enabled]
-    :or   {sample-count 5 interval-ms 60000 batch-size 10 enabled true}}]
+   stop!. Set :enabled false to run a no-op (tests/dev). `:dim-config` is the
+   Tunarr Scheduler vocabulary used to validate the model's dimension values."
+  [{:keys [ds tunabrain dim-config sample-count interval-ms batch-size enabled]
+    :or   {dim-config {} sample-count 5 interval-ms 60000 batch-size 10 enabled true}}]
   (if-not enabled
     (do (log/info "Directory-enrichment worker disabled") {:executor nil})
     (let [exec (Executors/newSingleThreadScheduledExecutor)]
       (.scheduleWithFixedDelay
        exec
-       (fn [] (try (run-once! ds tunabrain sample-count batch-size)
+       (fn [] (try (run-once! ds tunabrain dim-config sample-count batch-size)
                    (catch Throwable t
                      (log/error t "Directory-enrichment sweep crashed"))))
        (long interval-ms) (long interval-ms) TimeUnit/MILLISECONDS)
