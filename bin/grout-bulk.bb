@@ -25,6 +25,7 @@
          '[babashka.fs :as fs]
          '[babashka.process :as p]
          '[cheshire.core :as json]
+         '[clojure.java.io :as io]
          '[clojure.string :as str])
 
 (import '[java.security MessageDigest]
@@ -61,6 +62,15 @@ Options:
       --grout-cli PATH   grout-cli executable (default: grout-cli, found on PATH)
   -j, --jobs N           Parallel directories in flight (default 1, recommended
                          max 4: hashing is CPU-bound, upload saturates one link).
+      --progress-log PATH  Also append live progress to PATH: one line per file
+                         as it lands (current file + running M/N file & dir
+                         counts) plus per-directory start/done lines. Normal
+                         stdout is unchanged. Inside a pod, point this at
+                         /proc/1/fd/1 so progress reaches the container's PID 1
+                         stdout and shows up in `kubectl logs` — plain stdout
+                         from a `kubectl exec` session never gets there.
+                         Env: GROUT_BULK_PROGRESS_LOG. Best-effort: an
+                         unwritable sink warns once and never aborts the run.
       --retry-failed     For `run`: also re-run 'failed' directories, not just
                          pending/in_progress ones.
       --dry-run          Print the plan (which directories would run) and exit.
@@ -214,6 +224,42 @@ enrichment profile on the creator (the parent of each year leaf).
     (catch Exception _ "")))
 
 ;; --------------------------------------------------------------------------
+;; Progress logging (opt-in, best-effort)
+;; --------------------------------------------------------------------------
+
+(defn make-progress-logger
+  "Return a progress-logging fn for `sink` — a path such as /proc/1/fd/1 (so
+   lines land in the container's stdout and show up in `kubectl logs`), a plain
+   file, or a fifo. When `sink` is nil/blank, returns a no-op: progress logging
+   is opt-in and off by default.
+
+   Why this exists: run interactively via `kubectl exec`, grout-bulk's normal
+   stdout goes to the exec session, never to the container's PID 1 stdout — so
+   `kubectl logs` shows nothing. Pointing --progress-log at /proc/1/fd/1
+   mirrors progress onto PID 1's stdout, which the kubelet captures.
+
+   Each call appends one timestamped, newline-terminated line
+   (`<iso> [grout-bulk] <msg>`). Writes are serialized behind a lock (safe
+   across the parallel worker threads) and best-effort: an unwritable sink
+   never aborts a bulk run — it warns once to stderr, then stays silent.
+   Mirrors the manifest writer's 'a logging problem must not lose work' stance."
+  [sink]
+  (if (str/blank? sink)
+    (fn [_] nil)
+    (let [lock   (Object.)
+          warned (atom false)]
+      (fn [msg]
+        (locking lock
+          (try
+            (spit sink (str (now-iso) " [grout-bulk] " msg "\n") :append true)
+            (catch Exception e
+              (when (compare-and-set! warned false true)
+                (binding [*out* *err*]
+                  (println (str "warning: progress-log " sink " is unwritable ("
+                                (or (ex-message e) (str e))
+                                "); continuing without progress logging")))))))))))
+
+;; --------------------------------------------------------------------------
 ;; Filesystem discovery
 ;; --------------------------------------------------------------------------
 
@@ -284,7 +330,7 @@ enrichment profile on the creator (the parent of each year leaf).
    per-directory .jsonl manifest and stderr to a .log. Returns the updated unit
    record (never throws — a subprocess failure becomes a :status \"failed\"
    record with the error captured)."
-  [{:keys [grout-cli server logs-dir cli-extra]} unit-key* dir]
+  [{:keys [grout-cli server logs-dir cli-extra on-file]} unit-key* dir]
   (let [manifest (str (fs/path logs-dir (str (slugify unit-key*) ".jsonl")))
         errlog   (str (fs/path logs-dir (str (slugify unit-key*) ".log")))
         started  (now-iso)
@@ -300,8 +346,30 @@ enrichment profile on the creator (the parent of each year leaf).
         argv     (into base cli-extra)]
     (fs/create-dirs logs-dir)
     (try
-      (let [{:keys [exit out err]} @(p/process argv {:out :string :err :string})
-            objs   (parse-json-lines out)
+      ;; Stream grout-cli's --json stdout line-by-line instead of capturing the
+      ;; whole blob at once, so `on-file` can surface each file live (for
+      ;; --progress-log) as grout-cli reports it — otherwise per-file progress
+      ;; would only appear after the entire directory finished. We still rebuild
+      ;; the exact stdout for the on-disk manifest and collect the parsed
+      ;; objects for the tally, so nothing downstream changes.
+      (let [proc  (p/process argv {:out :stream :err :string})
+            sb    (StringBuilder.)
+            objs  (with-open [rdr (io/reader (:out proc))]
+                    (reduce (fn [acc raw]
+                              (.append sb raw)
+                              (.append sb "\n")
+                              (let [line (str/trim raw)]
+                                (if (str/blank? line)
+                                  acc
+                                  (if-let [m (try (json/parse-string line true)
+                                                  (catch Exception _ nil))]
+                                    (do (when on-file (on-file unit-key* m))
+                                        (conj acc m))
+                                    acc))))
+                            []
+                            (line-seq rdr)))
+            {:keys [exit err]} @proc
+            out    (.toString sb)
             tally  (tally-lines objs)
             enrich (some #(when (#{"enrich-by-tag" "dry-run-plan"} (:action %)) %) objs)]
         (spit manifest (or out ""))
@@ -439,16 +507,57 @@ enrichment profile on the creator (the parent of each year leaf).
             queue      (atom to-run)
             next!      (fn [] (locking lock (let [k (first @queue)]
                                               (when k (swap! queue rest)) k)))
+            ;; Opt-in progress logging (see make-progress-logger). --progress-log
+            ;; wins over $GROUT_BULK_PROGRESS_LOG; both absent => a no-op logger,
+            ;; so nothing changes unless a sink is requested. `counter` tracks
+            ;; files/dirs finished across all workers for the "M/N" heartbeat;
+            ;; `files-total` is its denominator — regular files under just the
+            ;; directories we're about to run (matches grout-cli's own per-dir set).
+            progress-sink (or (not-empty (str (:progress-log opts)))
+                              (not-empty (System/getenv "GROUT_BULK_PROGRESS_LOG")))
+            progress!   (make-progress-logger progress-sink)
+            files-total (reduce (fn [n k]
+                                  (+ n (try (count (filter fs/regular-file?
+                                                           (fs/list-dir (:dir (get units0 k)))))
+                                            (catch Exception _ 0))))
+                                0 to-run)
+            counter     (atom {:files 0 :dirs 0})
+            rel-file    (fn [abs] (try (str (fs/relativize abs-root abs))
+                                       (catch Exception _ (str (fs/file-name abs)))))
+            ;; Called per streamed grout-cli --json line; skips the trailing
+            ;; enrich summary (classify-line -> nil) and emits one progress line
+            ;; per actual file as it lands.
+            on-file    (fn [_k m]
+                         (when-let [bucket (classify-line m)]
+                           (let [c    (swap! counter update :files inc)
+                                 verb (case bucket
+                                        :uploaded "uploaded"
+                                        :retagged "retagged"
+                                        :existing "exists"
+                                        :failed   "FAILED")]
+                             (progress! (format "%-8s %s  (%d/%d files, %d/%d dirs)"
+                                                verb (rel-file (:file m))
+                                                (:files c) files-total
+                                                (:dirs c) (count to-run))))))
             ctx        {:grout-cli (:grout-cli opts) :server (:server opts)
-                        :logs-dir logs-dir :cli-extra cli-extra}
+                        :logs-dir logs-dir :cli-extra cli-extra :on-file on-file}
             worker     (fn [] (loop []
                                 (when-let [k (next!)]
                                   (let [dir (:dir (get-in @state-atom [:units k]))]
                                     (claim! k)
+                                    (progress! (format "start %s" k))
                                     (when-not quiet?
                                       (locking lock (println (format "-> %s" k))))
-                                    (let [rec (run-one! ctx k dir)]
+                                    (let [rec (run-one! ctx k dir)
+                                          c   (swap! counter update :dirs inc)]
                                       (record! k rec)
+                                      (progress! (format "done  %s  %du %dr %de%s  (%d/%d dirs, %d/%d files)"
+                                                         k (:uploaded rec 0) (:retagged rec 0)
+                                                         (:existing rec 0)
+                                                         (if (pos? (:failed rec 0))
+                                                           (str " " (:failed rec) "F") "")
+                                                         (:dirs c) (count to-run)
+                                                         (:files c) files-total))
                                       (locking lock
                                         (println (format "   %s  %s  (%du %dr %de%s)"
                                                         (:status rec) k
@@ -461,6 +570,8 @@ enrichment profile on the creator (the parent of each year leaf).
         (when-not quiet?
           (println (format "%s: %d directories under root, %d to %s (jobs=%d)"
                           abs-root (count units0) (count to-run) command jobs)))
+        (progress! (format "run %s: %s — %d dir(s), %d file(s) to process (jobs=%d)"
+                          command abs-root (count to-run) files-total jobs))
         (if (empty? to-run)
           (println "nothing to do — all directories are done")
           ;; Explicit threads (not futures): a joined Thread is dead when we
@@ -471,6 +582,9 @@ enrichment profile on the creator (the parent of each year leaf).
                               (range jobs))]
             (doseq [^Thread t threads] (.join t))))
         (let [s (summarize (:units @state-atom))]
+          (progress! (format "run complete: %d/%d dirs done, %d failed, %d pending — files: %d uploaded, %d retagged, %d existing"
+                            (:done s) (:total s) (:failed s) (:pending s)
+                            (:uploaded s) (:retagged s) (:existing s)))
           (println)
           (println (format "done: %d/%d directories complete, %d failed, %d pending"
                           (:done s) (:total s) (:failed s) (:pending s)))
@@ -529,6 +643,7 @@ enrichment profile on the creator (the parent of each year leaf).
    :state-dir    {:alias :d}
    :server       {:alias :s}
    :grout-cli    {:default "grout-cli"}
+   :progress-log {}
    :jobs         {:alias :j :coerce :long :default 1}
    :retry-failed {:coerce :boolean}
    :dry-run      {:coerce :boolean}

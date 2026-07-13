@@ -6,6 +6,7 @@
    unqualified. The script guards its `-main` on `babashka.file`, so loading it
    here only defines vars — it does not execute the CLI or dispatch grout-cli."
   (:require [clojure.test :refer [deftest is testing]]
+            [clojure.string :as str]
             [babashka.fs :as fs]))
 
 (load-file "bin/grout-bulk.bb")
@@ -151,6 +152,37 @@
       (is (= ["."] (map first (discover-units root)))
           "files directly under root make the root itself the one unit, keyed '.'")
       (finally (fs/delete-tree root)))))
+
+;; --- make-progress-logger: opt-in, best-effort progress sink ----------------
+
+(deftest make-progress-logger-is-a-noop-without-a-sink
+  (testing "nil/blank sink yields a no-op that swallows every call"
+    (is (nil? ((make-progress-logger nil) "anything")))
+    (is (nil? ((make-progress-logger "") "anything")))
+    (is (nil? ((make-progress-logger "   ") "anything")))))
+
+(deftest make-progress-logger-appends-timestamped-tagged-lines
+  (let [f   (str (fs/create-temp-file))
+        log (make-progress-logger f)]
+    (try
+      (log "start Adam Neely/2017")
+      (log "uploaded a.mp4  (1/3 files, 0/1 dirs)")
+      (let [lines (str/split-lines (slurp f))]
+        (is (= 2 (count lines)) "one line appended per call")
+        (is (every? #(str/includes? % "[grout-bulk] ") lines)
+            "every line carries the grout-bulk tag")
+        (is (str/ends-with? (first lines) "start Adam Neely/2017"))
+        (is (str/ends-with? (second lines) "uploaded a.mp4  (1/3 files, 0/1 dirs)"))
+        ;; A leading ISO-8601 timestamp (starts with a 4-digit year + '-').
+        (is (re-find #"^\d{4}-\d{2}-\d{2}T" (first lines))
+            "line is prefixed with an ISO-8601 timestamp"))
+      (finally (fs/delete-if-exists f)))))
+
+(deftest make-progress-logger-never-throws-on-an-unwritable-sink
+  (testing "a sink under a nonexistent directory warns once, doesn't throw or abort"
+    (let [log (make-progress-logger "/no/such/dir/really/progress.log")]
+      (is (nil? (log "first")) "unwritable sink is swallowed")
+      (is (nil? (log "second")) "and stays swallowed on subsequent calls"))))
 
 ;; --- human-duration: compact elapsed formatting -----------------------------
 
