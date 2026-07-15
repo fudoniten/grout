@@ -49,18 +49,18 @@ Directory-upload mode (--upload-dir):
                          a year/subdir and pass --group='Adam Neely Music' so every
                          subdir under a creator shares one parent-directory:adam-neely-music
                          profile. Defaults to the parent of --upload-dir's leaf.
-      --wait             Block on the enrichment call. By default --wait is
-                         off: the CLI fires the shared directory-level enrichment
-                         as a background `future` and exits as soon as the per-file
-                         uploads complete, so a 200-file run is bounded by
-                         hashing+I/O rather than by the LLM. Pass --wait to make
-                         the CLI block until the enrichment response returns
-                         (use this when the caller needs the profile-status, e.g.
-                         integration tests).
-      --no-wait          Like the default: fire the shared directory-level
-                         enrichment as a background `future` and exit. The
-                         Grout-side enrichment worker still runs to completion
-                         asynchronously; --no-wait is just the explicit form.
+      --wait             Ask the server to enrich inline. By default --wait is
+                         off: the shared directory-level enrichment is queued
+                         server-side (the CLI's trigger returns 202 at once) so a
+                         200-file run is bounded by hashing+I/O rather than by the
+                         LLM. Pass --wait to have the server run the enrichment
+                         inline (bounded server-side) and return the resolved
+                         profile-status (use this when the caller needs the
+                         status, e.g. integration tests).
+      --no-wait          Like the default: the server queues the shared
+                         directory-level enrichment for its periodic worker and
+                         returns immediately; the LLM still runs to completion
+                         asynchronously. --no-wait is just the explicit form.
                          (Provided for symmetry with --wait and for callers
                          scripting the bulk path.)
       --threshold-pct=N  Re-enrich only if the item count grew >N% (default 20)
@@ -322,15 +322,27 @@ Examples:
 
 (defn- json-headers [] {"Content-Type" "application/json" "Accept" "application/json"})
 
+;; Per-request timeout for the small JSON calls (by-hash, add-tag, enrich).
+;; All three are fast server-side: by-hash and add-tag are DB ops, and
+;; enrich-by-tag returns 202 immediately in the default (--no-wait) mode — the
+;; LLM is handed to a background worker, never on the request's critical path —
+;; while --wait is itself bounded to ~30s server-side. Without a timeout,
+;; babashka.http-client (java.net.http.HttpClient) waits forever for a response,
+;; so a stalled or unreachable server hangs the CLI indefinitely. Bounding these
+;; calls turns that into a reported error. Deliberately NOT applied to the
+;; multipart upload below, whose legitimate duration scales with file size.
+(def ^:private http-timeout (java.time.Duration/ofSeconds 120))
+
 (defn- http-get [url verbose?]
   (when verbose? (binding [*out* *err*] (println "GET" url)))
-  (let [resp (http/get url {:headers {"Accept" "application/json"} :throw false})]
+  (let [resp (http/get url {:headers {"Accept" "application/json"} :timeout http-timeout :throw false})]
     (assoc resp :json (when (seq (:body resp)) (json/parse-string (:body resp) true)))))
 
 (defn- http-post [url body verbose?]
   (when verbose? (binding [*out* *err*] (println "POST" url (json/generate-string body))))
   (let [resp (http/post url {:headers (json-headers)
                              :body (json/generate-string body)
+                             :timeout http-timeout
                              :throw false})]
     (assoc resp :json (when (seq (:body resp)) (json/parse-string (:body resp) true)))))
 
@@ -482,17 +494,19 @@ Examples:
               (flush-manifest! cache manifest file))
             (result! json? result))))
       ;; Fire the shared enrichment for the whole directory (unless a dry run).
+      ;; The request itself is always synchronous (see the enrich! note below);
+      ;; --wait vs --no-wait only controls whether the *server* blocks on the LLM.
       ;;
-      ;; --wait (legacy): block on the enrichment response. Use when the caller
-      ;; needs the synchronous profile-status (e.g. integration tests, the
-      ;; grout-bulk smoke test where a human is watching).
+      ;; --wait (legacy): ask the server to enrich inline (bounded ~30s server
+      ;; side) and return the resolved profile-status. Use when the caller needs
+      ;; that status (e.g. integration tests, the grout-bulk smoke test where a
+      ;; human is watching).
       ;;
-      ;; --no-wait / default: kick the enrichment into a background `future`
-      ;; and exit as soon as the per-file uploads complete. The Grout-side
-      ;; enrichment worker still runs the LLM call to completion; we just
-      ;; don't wait for it. This is what the bulk run wants — without it,
-      ;; a 200-file run is bounded by the LLM (~5-10s of compute per file
-      ;; + wait), not by hashing+I/O.
+      ;; --no-wait / default: the server flips the profile to `pending`, hands
+      ;; the LLM call to its periodic worker, and returns 202 immediately. The
+      ;; enrichment still runs to completion server-side; grout-cli just doesn't
+      ;; wait for the LLM. This is what the bulk run wants — a 200-file run is
+      ;; bounded by hashing+I/O, not by the LLM.
       (let [{:keys [uploaded retagged existing failed]} @tally]
         (if (:dry-run opts)
           (if json?
@@ -507,14 +521,36 @@ Examples:
                               (binding [*out* *err*]
                                 (println (format "enrich-by-tag %s -> %s" pd-tag pstatus))))
                             pstatus))
-                pstatus (if (:wait opts)
-                          (enrich!))] ; blocking — return value is the status
-            ;; Fire-and-forget path. Discard the future; bb will reap it on exit.
-            (when-not (:wait opts)
-              (future (try (enrich!) (catch Exception e
-                                       (binding [*out* *err*]
-                                         (println (str "background enrich failed: "
-                                                       (ex-message e))))))))
+                ;; Call enrich synchronously in BOTH modes. --no-wait's work is
+                ;; already async server-side: enrich-by-tag omits `:wait` from
+                ;; the body, so the handler flips the profile to `pending`, hands
+                ;; the LLM off to the periodic worker, and returns 202 at once.
+                ;; The response is therefore fast (and http-timeout-bounded), so
+                ;; there is nothing to gain by moving it off-thread — and a real
+                ;; cost to doing so. babashka's `future` runs on the non-daemon
+                ;; agent pool, which keeps the process alive after -main returns
+                ;; (grout-bulk.bb documents this exact stall and avoids `future`
+                ;; for it). When grout-cli is driven by grout-bulk over a pipe, a
+                ;; process that never exits never closes its stdout, so
+                ;; grout-bulk's line-seq reader blocks on EOF forever and the
+                ;; whole bulk run wedges on that directory — even though every
+                ;; file already uploaded. Running enrich inline lets grout-cli
+                ;; exit cleanly the moment its work is done.
+                ;;
+                ;; The trigger is best-effort: the files are already stored, and
+                ;; the profile is re-triggered on any later run (and the server's
+                ;; periodic worker sweeps pending profiles regardless). So a
+                ;; failed/timed-out trigger is logged and downgraded to
+                ;; profile-status "pending" rather than failing the whole
+                ;; directory — matching the pre-existing --no-wait leniency, and
+                ;; strictly gentler than the old --wait path, which would crash.
+                pstatus (try (enrich!)
+                             (catch Exception e
+                               (binding [*out* *err*]
+                                 (println (str "warning: enrichment trigger failed for " pd-tag
+                                               " (files were uploaded; profile will be enriched on a "
+                                               "later run): " (or (ex-message e) (str e)))))
+                               "pending"))]
             (if json?
               (println (json/generate-string {:action "enrich-by-tag" :tag pd-tag
                                               :concept concept :profile-status (or pstatus "pending")
@@ -555,7 +591,14 @@ Examples:
               (flush-manifest! cache manifest file))
             (result! (:json opts) result)))
         (when (pos? @failures)
-          (System/exit 1))))))
+          (System/exit 1)))))
+  ;; Belt-and-suspenders: shut down the agent thread pool on the way out so a
+  ;; stray `future`/`pmap`/`send-off` can never keep this process alive past its
+  ;; work. babashka's agent pool is non-daemon; a lingering task delays (or, if
+  ;; it blocks, prevents) exit, which — when grout-cli is driven by grout-bulk
+  ;; over a pipe — wedges the whole bulk run on an unread stdout (see the
+  ;; enrich! note in upload-dir!). No-op when nothing used the pool.
+  (shutdown-agents))
 
 ;; Only run when executed as a script, not when loaded/required by a test.
 (when (= *file* (System/getProperty "babashka.file"))

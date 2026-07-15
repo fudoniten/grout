@@ -334,13 +334,13 @@ enrichment profile on the creator (the parent of each year leaf).
   (let [manifest (str (fs/path logs-dir (str (slugify unit-key*) ".jsonl")))
         errlog   (str (fs/path logs-dir (str (slugify unit-key*) ".log")))
         started  (now-iso)
-        ;; --no-wait: hand the per-directory enrichment to grout-cli's
-        ;; background `future` and let the bulk dispatcher keep moving.
-        ;; Without this, each --upload-dir call blocks for ~5-10 minutes
-        ;; on the LLM enrichment response, and a 200-file run becomes
-        ;; ~10 hours of wall clock just waiting. The Grout-side enrichment
-        ;; worker still runs the LLM call to completion; --no-wait is just
-        ;; a "don't make grout-cli wait for the response" hint.
+        ;; --no-wait: tell grout-cli not to make the *server* block on the LLM
+        ;; for the per-directory enrichment. The server queues the enrichment for
+        ;; its periodic worker and returns 202 at once, so grout-cli's trigger
+        ;; call is fast and it exits promptly. Without this, each --upload-dir
+        ;; call blocks for ~5-10 minutes on the LLM enrichment response, and a
+        ;; 200-file run becomes ~10 hours of wall clock just waiting. The
+        ;; Grout-side enrichment worker still runs the LLM call to completion.
         base     (cond-> [grout-cli "--upload-dir" dir "--json" "--no-wait"]
                    server (conj "--server" server))
         argv     (into base cli-extra)]
