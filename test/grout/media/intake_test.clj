@@ -1,5 +1,6 @@
 (ns grout.media.intake-test
-  (:require [clojure.test :refer [deftest is]]
+  (:require [clojure.java.io :as io]
+            [clojure.test :refer [deftest is]]
             [grout.media.hash :as hash]
             [grout.media.intake :as intake]
             [grout.media.probe :as probe]
@@ -110,10 +111,25 @@
 (deftest non-unique-sql-error-propagates
   ;; Only a unique violation is swallowed as a dedup; any other DB error must
   ;; still surface so it isn't silently misreported as a successful store.
-  (with-redefs [hash/sha256-file    (fn [_] "h")
+  (with-redefs [hash/sha256-file    (fn [_] "hh")
                 store/find-by-hash  (fn [_ _] nil)
                 probe/normalize-to! (fn [_ out _] {:path out :probe {:duration-ms 1000} :normalized false})
                 store/create!       (fn [_ _] (throw (java.sql.SQLException. "connection lost" "08006")))]
     (is (thrown? java.sql.SQLException
                  (intake/intake! {:ds nil :media-dir "/m"}
                                  {:path "/x.mp4" :kind "bumper"})))))
+
+(deftest non-unique-sql-error-cleans-up-orphaned-file
+  ;; The normalized file is written to its content-addressed path before the
+  ;; insert runs. If the insert then fails for a non-dedup reason, that file
+  ;; must not be left behind orphaned on disk with no DB row pointing at it.
+  (let [deleted (atom nil)]
+    (with-redefs [hash/sha256-file    (fn [_] "hh")
+                  store/find-by-hash  (fn [_ _] nil)
+                  probe/normalize-to! (fn [_ out _] {:path out :probe {:duration-ms 1000} :normalized false})
+                  store/create!       (fn [_ _] (throw (java.sql.SQLException. "connection lost" "08006")))
+                  io/delete-file      (fn [path _] (reset! deleted path))]
+      (is (thrown? java.sql.SQLException
+                   (intake/intake! {:ds nil :media-dir "/m"}
+                                   {:path "/x.mp4" :kind "bumper"})))
+      (is (= "/m/hh/hh.mp4" @deleted) "orphaned normalized file removed after failed insert"))))

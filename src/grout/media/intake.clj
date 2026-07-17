@@ -6,7 +6,8 @@
    re-storing; otherwise copy-normalize the source into a content-addressed
    path under the media dir and insert a new row (enriched=false). The caller's
    source file is never mutated."
-  (:require [grout.media.hash :as hash]
+  (:require [clojure.java.io :as io]
+            [grout.media.hash :as hash]
             [grout.media.probe :as probe]
             [grout.media.store :as store]
             [taoensso.timbre :as log]))
@@ -67,15 +68,15 @@
   (let [content-hash (hash/sha256-file path)]
     (if-let [existing (store/find-by-hash ds content-hash)]
       {:row (dedup! ds existing req) :deduplicated true}
-      (try
-        (let [out (hash/content-path (or media-dir (.getParent (java.io.File. ^String path)))
-                                     content-hash)
-              {final-path :path pr :probe normalized :normalized}
-              (probe/normalize-to! path out (or profile probe/default-profile))]
-          (when-not (:duration-ms pr)
-            (throw (ex-info "Could not determine media duration" {:path final-path})))
-          (log/info "Intake stored new item"
-                    {:path final-path :normalized normalized :hash content-hash})
+      (let [out (hash/content-path (or media-dir (.getParent (java.io.File. ^String path)))
+                                   content-hash)
+            {final-path :path pr :probe normalized :normalized}
+            (probe/normalize-to! path out (or profile probe/default-profile))]
+        (when-not (:duration-ms pr)
+          (throw (ex-info "Could not determine media duration" {:path final-path})))
+        (log/info "Intake stored new item"
+                  {:path final-path :normalized normalized :hash content-hash})
+        (try
           {:row (store/create! ds
                                {:kind (derive-kind kind (:duration-ms pr))
                                 :path final-path
@@ -92,12 +93,17 @@
                                 :source source
                                 :source_url source-url
                                 :enriched false})
-           :deduplicated false})
-        (catch Exception e
-          ;; Lost the content_hash check-then-insert race: an identical upload
-          ;; committed after our find-by-hash miss. Fold into the now-existing
-          ;; row instead of surfacing the unique violation as a 500.
-          (if-let [existing (and (unique-violation? e)
-                                 (store/find-by-hash ds content-hash))]
-            {:row (dedup! ds existing req) :deduplicated true}
-            (throw e)))))))
+           :deduplicated false}
+          (catch Exception e
+            ;; Lost the content_hash check-then-insert race: an identical upload
+            ;; committed after our find-by-hash miss. Fold into the now-existing
+            ;; row instead of surfacing the unique violation as a 500.
+            (if-let [existing (and (unique-violation? e)
+                                   (store/find-by-hash ds content-hash))]
+              {:row (dedup! ds existing req) :deduplicated true}
+              (do
+                ;; The normalized file already landed at final-path before the
+                ;; insert failed; without cleanup it's orphaned on disk with no
+                ;; DB row pointing at it.
+                (io/delete-file final-path true)
+                (throw e)))))))))
