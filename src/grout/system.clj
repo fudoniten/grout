@@ -5,6 +5,7 @@
             [grout.enrichment.worker :as worker]
             [grout.enrichment.directory-worker :as directory-worker]
             [grout.http.server :as http]
+            [grout.media.accel :as accel]
             [grout.retention :as retention]
             [grout.tunabrain :as tunabrain]
             [grout.tunarr_scheduler :as tunarr-scheduler]
@@ -162,7 +163,16 @@
   nil)
 
 (defmethod ig/init-key :grout/media [_ {:keys [db media-dir profile tunabrain dim-catalog sample-count]}]
-  (let [dim-config (build-dim-config dim-catalog)]
+  (let [dim-config (build-dim-config dim-catalog)
+        ;; Force the (memoised) host GPU probe now, at startup, rather than
+        ;; lazily on the first intake transcode — `grout.media.accel`'s
+        ;; `detect-accels` logs the render-node/NVIDIA-device detail; this
+        ;; pairs it with the profile's requested backend so the two together
+        ;; show, at a glance, whether GPU transcode will actually engage.
+        available-accels (accel/available-accels)]
+    (log/info "FFmpeg transcode acceleration ready"
+              {:requested-accel (get profile :accel :auto)
+               :available-accels available-accels})
     (log/info "Media store ready" {:media-dir media-dir :dim-config-count (count dim-config)})
     {:ds db :media-dir media-dir :profile profile
      :tunabrain tunabrain

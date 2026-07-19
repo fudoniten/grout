@@ -67,9 +67,22 @@
 
 (defn detect-accels
   "Probes the host for available hardware-acceleration backends. Returns a set
-   always containing :none plus any of :nvenc / :vaapi actually usable here."
+   always containing :none plus any of :nvenc / :vaapi actually usable here.
+
+   Logs the raw probe inputs (render-node drivers, NVIDIA device presence)
+   alongside the resulting set, so a host that unexpectedly lands on software
+   encoding can be diagnosed from the startup log alone — e.g. an NVIDIA-only
+   render node correctly yields no :vaapi (see `accels-from`), which reads as
+   surprising without the driver list."
   []
-  (accels-from (render-node-drivers) (file-exists? "/dev/nvidia0")))
+  (let [drivers (render-node-drivers)
+        nvidia? (file-exists? "/dev/nvidia0")
+        accels  (accels-from drivers nvidia?)]
+    (log/info "Detected FFmpeg hardware-acceleration backends"
+              {:available accels
+               :render-node-drivers drivers
+               :nvidia-device-present nvidia?})
+    accels))
 
 (def available-accels
   "Memoised set of accel backends available on this host. Detection is a cheap

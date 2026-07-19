@@ -78,13 +78,23 @@
 ;; keeps the original `-pix_fmt` conversion (GPU frames are formatted by the
 ;; filter instead). Audio + faststart are backend-independent.
 (defn- transcode-args [in out profile]
-  (let [accel (accel/resolve-accel (:accel profile))
-        vf    (accel/video-filter accel)]
+  (let [requested (:accel profile)
+        accel     (accel/resolve-accel requested)
+        vf        (accel/video-filter accel)
+        venc      (accel/video-encode-args accel (:vcodec profile))]
+    ;; The concrete encoder (e.g. h264_nvenc vs libx264) is the actionable bit
+    ;; when eyeballing whether a given intake actually used the GPU; it's the
+    ;; second element of venc ("-c:v" <encoder> ...).
+    (log/info "Transcoding media"
+              {:in in :out out
+               :requested-accel (or requested :auto)
+               :accel accel
+               :encoder (second venc)})
     (-> [ffmpeg-bin "-y"]
         (into (accel/input-args accel))
         (into ["-i" in])
         (cond-> vf (into ["-vf" vf]))
-        (into (accel/video-encode-args accel (:vcodec profile)))
+        (into venc)
         (cond-> (= accel :none) (into ["-pix_fmt" (:pix-fmt profile)]))
         (into ["-c:a" "aac" "-b:a" (:audio-bitrate profile)
                "-ar" (str (:sample-rate profile))
