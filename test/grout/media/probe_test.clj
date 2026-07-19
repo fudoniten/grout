@@ -35,3 +35,18 @@
     (is (not (probe/conforms? (assoc good :acodec "mp3") probe/default-profile)))
     (is (not (probe/conforms? (assoc good :sample-rate 44100) probe/default-profile)))
     (is (not (probe/conforms? (assoc good :pix-fmt "yuv444p") probe/default-profile)))))
+
+(deftest software-transcode-args-unchanged
+  ;; Guards that a software (`:accel :none`) transcode still emits the original
+  ;; command: bare libx264 + -pix_fmt, no hardware device/hwaccel/-vf flags.
+  ;; This is the fallback path on CPU-only hosts, so it must not regress.
+  (let [transcode-args #'probe/transcode-args
+        args (transcode-args "in.mkv" "out.mp4"
+                             (assoc probe/default-profile :accel :none))]
+    (is (= ["-c:v" "libx264" "-pix_fmt" "yuv420p"]
+           (->> args (drop-while #(not= % "in.mkv")) rest (take 4)))
+        "video encode is unchanged libx264 + pixfmt")
+    (is (not-any? #{"-hwaccel" "-init_hw_device" "-vf"} args)
+        "no hardware flags on the software path")
+    (is (= "+faststart" (nth args (inc (.indexOf ^java.util.List args "-movflags"))))
+        "faststart preserved")))

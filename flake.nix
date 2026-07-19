@@ -68,13 +68,32 @@
             repo = "registry.kube.sea.fudo.link";
             tags = [ "latest" version.versionTag ];
             # Keep ffmpeg/ffprobe on PATH for the intake/normalize pipeline.
-            pathEnv = with pkgs; [ ffmpeg ];
+            # nixpkgs' ffmpeg is built with --enable-nvenc and --enable-vaapi,
+            # so hardware-accelerated intake transcode (grout.media.accel)
+            # needs no special ffmpeg build: NVENC's encode library is injected
+            # at runtime by the `nvidia` runtimeClass, and VAAPI needs a
+            # userspace driver shipped here. libva-utils provides `vainfo` for
+            # debugging VAAPI inside the pod. See the GPU wiring in
+            # seattle-infra's deployment-grout.yaml.
+            pathEnv = with pkgs; [ ffmpeg procps libva-utils ];
             env = {
               GIT_COMMIT = version.gitCommit;
               GIT_TIMESTAMP = version.gitTimestamp;
               VERSION = version.versionTag;
               FFMPEG_PATH = "${pkgs.ffmpeg}/bin/ffmpeg";
               FFPROBE_PATH = "${pkgs.ffmpeg}/bin/ffprobe";
+              # VAAPI hardware acceleration (Intel). ffmpeg ships with
+              # --enable-vaapi, but libva still needs a driver to talk to the
+              # GPU; a bare container has none, so VAAPI init fails with "No VA
+              # display found for device". Ship the Intel iHD driver and point
+              # libva at it (NixOS normally does this via hardware.graphics,
+              # absent in a plain image). Referencing the driver store path here
+              # also pulls it into the image closure. Mirrors Pseudovision.
+              # (NVENC needs none of this — its driver comes from the nvidia
+              # runtimeClass.) For pre-Broadwell GPUs use intel-vaapi-driver +
+              # LIBVA_DRIVER_NAME=i965.
+              LIBVA_DRIVER_NAME = "iHD";
+              LIBVA_DRIVERS_PATH = "${pkgs.intel-media-driver}/lib/dri";
             };
             entrypoint =
               let grout = self.packages."${system}".grout;

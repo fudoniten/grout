@@ -10,12 +10,21 @@
 
  :media {:media-dir #or [#env GROUT_MEDIA_DIR "/data/media/grout"]
          ;; Playout profile for intake normalization (GROUT.md §8).
+         ;; :accel picks the transcode backend (grout.media.accel):
+         ;;   auto  -> hardware (NVENC/VAAPI) when the host exposes a GPU,
+         ;;            software otherwise (safe default: same image runs
+         ;;            everywhere).
+         ;;   none  -> force software (e.g. to keep a shared GPU free for
+         ;;            Pseudovision's latency-sensitive live playout).
+         ;;   nvenc / vaapi -> force a backend (still falls back to software
+         ;;            with a warning if that backend is absent on the host).
          :profile {:vcodec "h264"
                    :pix-fmt "yuv420p"
                    :acodec "aac"
                    :sample-rate 48000
                    :channels 2
-                   :audio-bitrate "192k"}}
+                   :audio-bitrate "192k"
+                   :accel #or [#env GROUT_FFMPEG_ACCEL "auto"]}}
 
  ;; Tunabrain: typed, purposeful endpoints (see
  ;; /opt/data/home/docs/grout-tunabrain-enrichment-requirements.md).

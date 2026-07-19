@@ -9,19 +9,27 @@
             [clojure.java.io :as io]
             [clojure.java.shell :as sh]
             [clojure.string :as str]
+            [grout.media.accel :as accel]
             [taoensso.timbre :as log]))
 
 (def ^:private ffprobe-bin (or (System/getenv "FFPROBE_PATH") "ffprobe"))
 (def ^:private ffmpeg-bin (or (System/getenv "FFMPEG_PATH") "ffmpeg"))
 
 (def default-profile
-  "PV playout profile — mirrors Tunarr Scheduler's bumper profile."
+  "PV playout profile — mirrors Tunarr Scheduler's bumper profile.
+
+   `:accel` selects the transcode backend (see `grout.media.accel`): `:auto`
+   uses hardware acceleration when the host exposes it and falls back to
+   software otherwise, so the same image runs on GPU and CPU-only nodes.
+   Override via the profile config / `GROUT_FFMPEG_ACCEL` (`none` forces
+   software, e.g. to keep a shared GPU free for live playout)."
   {:vcodec "h264"
    :pix-fmt "yuv420p"
    :acodec "aac"
    :sample-rate 48000
    :channels 2
-   :audio-bitrate "192k"})
+   :audio-bitrate "192k"
+   :accel :auto})
 
 (defn- last-lines [s n]
   (when s (->> (str/split-lines s) (take-last n) (str/join "\n"))))
@@ -63,14 +71,26 @@
   (let [dot (.lastIndexOf ^String path ".")]
     (str (if (pos? dot) (subs path 0 dot) path) ext)))
 
+;; Transcode to the playout profile, offloading video encode to the GPU when a
+;; backend is available (GROUT.md §8). `accel/resolve-accel` downgrades to
+;; software on CPU-only hosts, so this same arg vector is correct everywhere.
+;; The hardware paths add pre-`-i` device flags and a `-vf` hwupload; software
+;; keeps the original `-pix_fmt` conversion (GPU frames are formatted by the
+;; filter instead). Audio + faststart are backend-independent.
 (defn- transcode-args [in out profile]
-  [ffmpeg-bin "-y" "-i" in
-   "-c:v" "libx264" "-pix_fmt" (:pix-fmt profile)
-   "-c:a" "aac" "-b:a" (:audio-bitrate profile)
-   "-ar" (str (:sample-rate profile))
-   "-ac" (str (:channels profile))
-   "-movflags" "+faststart"
-   out])
+  (let [accel (accel/resolve-accel (:accel profile))
+        vf    (accel/video-filter accel)]
+    (-> [ffmpeg-bin "-y"]
+        (into (accel/input-args accel))
+        (into ["-i" in])
+        (cond-> vf (into ["-vf" vf]))
+        (into (accel/video-encode-args accel (:vcodec profile)))
+        (cond-> (= accel :none) (into ["-pix_fmt" (:pix-fmt profile)]))
+        (into ["-c:a" "aac" "-b:a" (:audio-bitrate profile)
+               "-ar" (str (:sample-rate profile))
+               "-ac" (str (:channels profile))
+               "-movflags" "+faststart"
+               out]))))
 
 ;; Conforming files only need the moov atom moved to the front for faststart;
 ;; a stream copy is cheap and lossless.
