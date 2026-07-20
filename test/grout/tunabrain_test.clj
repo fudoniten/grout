@@ -271,6 +271,36 @@
     (is (= 2 (:sample_count (body-as-map)))
         "sample_count defaults to the number of filenames supplied")))
 
+(deftest enrich-profile-sends-categories-when-dim-config-supplied
+  (let [resp-body (json/generate-string
+                    {:concept_name "Computerphile"
+                     :dimensions {:channel ["infobytes"]}
+                     :tags ["programming"]
+                     :grounding_source "filename-pattern"
+                     :warnings []})
+        dim-config {:channel {:description "channel desc with toontown: Animated"
+                              :values ["toontown" "infobytes"]}}]
+    (with-mock (mock-post {:status 200 :body resp-body})
+      (tb/request-enrich-profile! cl "Computerphile"
+                                  ["a.mp4" "b.mp4"]
+                                  :sample-count 2
+                                  :dim-config dim-config)
+      (let [body (body-as-map)]
+        (is (contains? body :categories)
+            ":dim-config is sent as the :categories field so Tunabrain sees the controlled vocabulary")
+        (is (= ["toontown" "infobytes"] (get-in body [:categories :channel :values])))
+        (is (clojure.string/includes? (get-in body [:categories :channel :description])
+                                      "toontown: Animated"))))))
+
+(deftest enrich-profile-omits-categories-when-dim-config-empty
+  (with-mock (mock-post {:status 200
+                         :body (json/generate-string {:concept_name "X" :dimensions {} :tags []})})
+    (tb/request-enrich-profile! cl "X" ["a.mp4"]
+                                :dim-config {}) ;; empty → no :categories in payload
+    (let [body (body-as-map)]
+      (is (not (contains? body :categories))
+          "empty :dim-config means no :categories field; preserves the pre-PR wire shape for callers that don't track the catalog"))))
+
 ;; --- endpoint sanitization --------------------------------------------------
 
 (deftest create-strips-trailing-slashes
