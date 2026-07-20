@@ -1,4 +1,4 @@
-(ns grout.tunarr_scheduler_test
+(ns grout.tunarr-scheduler-test
   "Tests for the Tunarr Scheduler dimensions-catalog client."
   (:require [clojure.test :refer [deftest is]]
             [clj-http.client :as http]
@@ -117,11 +117,113 @@
           #"connection refused"
           (ts/fetch-dimensions! cl dim-descriptions)))))
 
+;; --- fetch-channel-descriptions! --------------------------------------------
+
+(deftest fetch-channel-descriptions-returns-value-description-map
+  (let [descriptions-body (json/generate-string
+                            {:values [{:value "toontown"  :description "Animated content..."}
+                                      {:value "infobytes" :description "Science & technology"}
+                                      {:value "spotlight" :description "All movies, all the time."}]})
+        responses         {(str endpoint "/api/dimensions/channel/descriptions")
+                           {:status 200 :body descriptions-body}}]
+    (with-redefs [http/get (fake-get responses)]
+      (let [result (ts/fetch-channel-descriptions! cl)]
+        (is (= 3 (count result)))
+        (is (= "Animated content..." (get result "toontown")))
+        (is (= "Science & technology" (get result "infobytes")))
+        (is (= "All movies, all the time." (get result "spotlight")))))))
+
+(deftest fetch-channel-descriptions-keeps-empty-descriptions-not-drops-them
+  (let [descriptions-body (json/generate-string
+                            {:values [{:value "toontown"  :description "Animated"}
+                                      {:value "blank-one" :description ""}]})
+        responses         {(str endpoint "/api/dimensions/channel/descriptions")
+                           {:status 200 :body descriptions-body}}]
+    (with-redefs [http/get (fake-get responses)]
+      (let [result (ts/fetch-channel-descriptions! cl)]
+        (is (= 2 (count result)) "blank-description channels stay in the controlled vocabulary")
+        (is (= "" (get result "blank-one")))))))
+
+(deftest fetch-channel-descriptions-returns-empty-map-on-404
+  (with-redefs [http/get (constantly {:status 404 :body "no such endpoint"})]
+    (let [result (ts/fetch-channel-descriptions! cl)]
+      (is (= {} result) "404 → empty map so callers fall back to the static :channel description"))))
+
+(deftest fetch-channel-descriptions-returns-empty-map-on-empty-payload
+  (with-redefs [http/get (constantly {:status 200 :body (json/generate-string {:values []})})]
+    (let [result (ts/fetch-channel-descriptions! cl)]
+      (is (= {} result) "empty values → empty map, not a crash"))))
+
+(deftest fetch-channel-descriptions-propagates-non-404-http-errors
+  (with-redefs [http/get (constantly {:status 503 :body "unavailable"})]
+    (is (thrown-with-msg?
+          clojure.lang.ExceptionInfo
+          #"503"
+          (ts/fetch-channel-descriptions! cl))
+        "non-404 HTTP failures should propagate so callers can retry")))
+
+;; --- fetch-dimensions! with channel-descriptions ---------------------------
+
+(deftest fetch-dimensions-embeds-channel-descriptions-in-channel-category
+  (let [audience-body (json/generate-string
+                        {:values [{:value "kids" :usage-count 10}]})
+        channel-body  (json/generate-string
+                        {:values [{:value "goldenreels" :usage-count 50}
+                                  {:value "toontown"    :usage-count 30}]})
+        descs-body    (json/generate-string
+                        {:values [{:value "toontown"    :description "Animated content"}
+                                  {:value "goldenreels" :description "Classic films"}]})
+        catalog-body  (json/generate-string
+                        {:dimensions [{:name "audience" :value-count 1}
+                                      {:name "channel"  :value-count 2}]})
+        responses     {(str endpoint "/api/dimensions")                       {:status 200 :body catalog-body}
+                       (str endpoint "/api/dimensions/audience/values")        {:status 200 :body audience-body}
+                       (str endpoint "/api/dimensions/channel/values")         {:status 200 :body channel-body}
+                       (str endpoint "/api/dimensions/channel/descriptions")   {:status 200 :body descs-body}}]
+    (with-redefs [http/get (fake-get responses)]
+      (let [result    (ts/fetch-dimensions! cl dim-descriptions
+                                            {"toontown" "Animated content"
+                                             "goldenreels" "Classic films"})
+            channel-desc (get-in result [:channel :description])]
+        (is (clojure.string/includes? channel-desc "toontown: Animated content")
+            "channel description embeds each value with its TS description")
+        (is (clojure.string/includes? channel-desc "goldenreels: Classic films"))
+        (is (= ["goldenreels" "toontown"] (get-in result [:channel :values]))
+            "values list is unchanged regardless of descriptions")))))
+
+(deftest fetch-dimensions-channel-falls-back-when-descriptions-map-empty
+  (let [channel-body (json/generate-string
+                        {:values [{:value "goldenreels" :usage-count 50}]})
+        catalog-body (json/generate-string
+                       {:dimensions [{:name "channel" :value-count 1}]})
+        responses    {(str endpoint "/api/dimensions")                     {:status 200 :body catalog-body}
+                      (str endpoint "/api/dimensions/channel/values")       {:status 200 :body channel-body}}]
+    (with-redefs [http/get (fake-get responses)]
+      ;; Note: no /descriptions URL in the responses map → 404 from get-json
+      ;; → fetch-channel-descriptions! returns {} → channel description falls
+      ;; back to the static :channel entry in dim-descriptions.
+      (let [result (ts/fetch-dimensions! cl dim-descriptions {})]
+        (is (= "Tunarr Scheduler channels" (get-in result [:channel :description]))
+            "empty channel-descriptions map → static :channel description unchanged")))))
+
+(deftest fetch-dimensions-non-channel-dim-is-unaffected-by-channel-descriptions
+  (let [audience-body (json/generate-string
+                        {:values [{:value "kids" :usage-count 10}]})
+        catalog-body  (json/generate-string
+                        {:dimensions [{:name "audience" :value-count 1}]})
+        responses     {(str endpoint "/api/dimensions")                {:status 200 :body catalog-body}
+                       (str endpoint "/api/dimensions/audience/values") {:status 200 :body audience-body}}]
+    (with-redefs [http/get (fake-get responses)]
+      (let [result (ts/fetch-dimensions! cl dim-descriptions
+                                          {"toontown" "Animated content"})]
+        (is (= "Audience segments" (get-in result [:audience :description]))
+            "non-channel dimensions don't get the per-channel prompt appended")))))
+
 ;; --- retry -----------------------------------------------------------------
 
 (deftest retry-succeeds-on-second-attempt
   (let [attempts (atom 0)]
-    (with-redefs [ts/fetch-dimensions! (fn [_ _]
+    (with-redefs [ts/fetch-dimensions! (fn [& _]
                                           (swap! attempts inc)
                                           (if (= 1 @attempts)
                                             (throw (java.net.ConnectException. "refused"))
@@ -129,7 +231,7 @@
       (let [result (ts/fetch-dimensions-with-retry!
                      (ts/create {:endpoint endpoint}) dim-descriptions 3)]
         (is (= 2 @attempts))
-        (is (contains? result "audience"))))))
+        (is (contains? result :audience))))))
 
 ;; --- create -----------------------------------------------------------------
 

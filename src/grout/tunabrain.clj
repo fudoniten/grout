@@ -271,6 +271,15 @@
                         content signal Tunabrain gets)
     :sample-count     — optional; the intended sample size (informational).
                         Defaults to the count actually supplied.
+    :dim-config       — optional `dimension-name -> {:description, :values}`
+                        map from `grout.tunarr_scheduler/fetch-dimensions!`.
+                        When supplied, it's sent as the `:categories` field
+                        so the model sees the controlled vocabulary
+                        (including per-channel descriptions) before it
+                        picks dimensions. Without this, the model has
+                        no channel vocabulary and routinely invents a
+                        description-word (`educational`, `thriller`)
+                        that the controlled-vocabulary guard drops.
 
   Returns a map:
     `:concept-name`     — echoed back
@@ -281,19 +290,21 @@
 
   Throws on HTTP error, connection refused, or unknown host — the caller
   (directory worker) catches and marks the profile failed for retry."
-  [client concept-name sample-filenames & {:keys [sample-count]}]
+  [client concept-name sample-filenames & {:keys [sample-count dim-config]}]
   (let [filenames (vec sample-filenames)
-        payload   {:concept_name    concept-name
-                   :sample_filenames filenames
-                   :sample_count    (or sample-count (count filenames))}
+        payload   (cond-> {:concept_name     concept-name
+                           :sample_filenames filenames
+                           :sample_count     (or sample-count (count filenames))}
+                    (seq dim-config) (assoc :categories (build-categories dim-config)))
         resp      (json-post! client "/enrich/profile" payload)]
     (when-not (map? resp)
       (throw (ex-info "Tunabrain /enrich/profile returned non-map"
                       {:response resp})))
-    (log/info (format "Enrich profile '%s': %d dimensions, %d tags"
+    (log/info (format "Enrich profile '%s': %d dimensions, %d tags%s"
                       concept-name
                       (count (:dimensions resp))
-                      (count (:tags resp))))
+                      (count (:tags resp))
+                      (if (seq dim-config) " (with categories)" "")))
     {:concept-name     (:concept_name resp)
      :dimensions       (or (:dimensions resp) {})
      :tags             (vec (or (:tags resp) []))

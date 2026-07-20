@@ -18,18 +18,21 @@
 (defn enrich-profile-one!
   "Enrich a single directory profile end-to-end and return the updated profile.
 
-   Steps: sample the group's filenames, call Tunabrain, fan the result out to
-   every child row (union tags, COALESCE-fill channel, mark enriched), then mark
-   the profile `ready`. Any failure (no samples, empty result, Tunabrain error)
-   marks the profile `failed` with backoff so a later sweep retries.
+  Steps: sample the group's filenames, call Tunabrain, fan the result out to
+  every child row (union tags, COALESCE-fill channel, mark enriched), then mark
+  the profile `ready`. Any failure (no samples, empty result, Tunabrain error)
+  marks the profile `failed` with backoff so a later sweep retries.
 
-   The `tunabrain` arg is the bare `TunabrainClient`. `dim-config` is the
-   controlled vocabulary fetched from Tunarr Scheduler; the model's dimension
-   values are validated against it (see `grout.dimensions/filter-dimension-map`)
-   before they become tags or set a row's `channel`, so a hallucinated channel
-   or audience never fans out to the group. An empty `dim-config` disables the
-   check (every dimension passes through). Returns the profile row as left in
-   the DB (`ready` or `failed`), or nil if no profile exists for the tag."
+  The `tunabrain` arg is the bare `TunabrainClient`. `dim-config` is the
+  controlled vocabulary fetched from Tunarr Scheduler; the model's dimension
+  values are validated against it (see `grout.dimensions/filter-dimension-map`)
+  before they become tags or set a row's `channel`, so a hallucinated channel
+  or audience never fans out to the group. `dim-config` is ALSO sent to
+  Tunabrain as the `:categories` field on `/enrich/profile`, so the model
+  sees the controlled vocabulary (incl. per-channel descriptions) before
+  picking dimensions. An empty `dim-config` disables both the validation
+  AND the prompt-side hint. Returns the profile row as left in the DB
+  (`ready` or `failed`), or nil if no profile exists for the tag."
   [ds tunabrain dim-config sample-count tag-value]
   (when-let [profile (dp/get-profile-for-tag ds tag-value)]
     (try
@@ -39,7 +42,9 @@
                         {:tag tag-value})
               (dp/mark-failed! ds tag-value "no sample filenames available for tag"))
           (let [resp        (tb/request-enrich-profile! tunabrain (:concept_name profile)
-                                                        samples :sample-count sample-count)
+                                                        samples
+                                                        :sample-count sample-count
+                                                        :dim-config   dim-config)
                 {dimensions :dimensions rejected :rejected}
                 (dim/filter-dimension-map dim-config (:dimensions resp))
                 _           (dim/log-rejected! rejected {:tag tag-value})
