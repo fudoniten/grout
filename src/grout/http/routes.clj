@@ -152,7 +152,16 @@
            :parameters {:path s/TagPath}
            :responses {200 {:body s/DirectoryProfile}
                        404 {:body s/APIError}}
-           :handler (dirprof/get-profile-handler media)}}]
+           :handler (dirprof/get-profile-handler media)}
+     :patch {:tags ["directory-profiles"]
+             :summary "Manually override a directory/tag-group profile's dimensions, tags, and/or grounding context"
+             :description "Bypasses the LLM entirely. Setting :dimensions and/or :tags locks the profile (growth-triggered re-enrichment then skips calling Tunabrain until force=true or an explicit {:locked false}) and immediately re-applies the correction to every child media row — including overwriting an already-wrong channel, unlike the LLM fan-out's fill-blanks-only behavior."
+             :parameters {:path s/TagPath
+                          :body s/DirectoryProfilePatch}
+             :responses {200 {:body s/DirectoryProfile}
+                         400 {:body s/APIError}
+                         404 {:body s/APIError}}
+             :handler (dirprof/patch-handler media)}}]
 
    ["/grout/media/:id/tags"
     {:get {:tags ["media"]

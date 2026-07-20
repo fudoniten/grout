@@ -7,11 +7,14 @@
    every child `grout_media` row (see `grout.media.store/apply-directory-profile!`),
    replacing the per-file `/enrich/short-form` call for bulk imports.
 
-   Plain next.jdbc + parameterized SQL (rather than honeysql): the ON CONFLICT
-   upsert, the JSONB columns, and the array-indexed backoff are all clearer as
-   literal SQL, and this table has no honeysql query-builder to share."
+   Mostly plain next.jdbc + parameterized SQL (rather than honeysql): the ON
+   CONFLICT upsert, the JSONB columns, and the array-indexed backoff are all
+   clearer as literal SQL. `set-manual!` (the operator-edit path) is the one
+   exception — its SET clause is conditional on which fields the caller
+   provided, which honeysql expresses far more cleanly than string-building."
   (:require [cheshire.core :as json]
             [clojure.string :as str]
+            [honey.sql :as sql]
             [next.jdbc :as jdbc]
             [next.jdbc.result-set :as rs])
   (:import [org.postgresql.util PGobject]))
@@ -70,17 +73,38 @@
       :else                (let [s (str/trim (str parsed))]
                              (when-not (str/blank? s) [s])))))
 
+(defn- coerce-context
+  "Parse the `context` JSONB column to `{:text ... :links [...]}` (or nil).
+  Defensive like `coerce-dimensions`/`coerce-tags`: blanks are dropped from
+  both `:text` and `:links`, and an entirely-empty result (no text, no
+  links) collapses to nil rather than `{}` so the response schema's `:maybe`
+  stays meaningful (\"no context set\" vs. \"context set but empty\" are the
+  same thing to a caller)."
+  [v]
+  (let [parsed (coerce-jsonb v)]
+    (when (map? parsed)
+      (let [{:keys [text links]} (update-keys parsed keyword)
+            text  (some-> text str str/trim not-empty)
+            links (not-empty (->> links (map str) (map str/trim) (remove str/blank?) vec))]
+        (when (or text links)
+          (cond-> {}
+            text  (assoc :text text)
+            links (assoc :links links)))))))
+
 (defn ->profile
-  "Coerce a raw row map into a profile: the `dimensions` and `tags` JSONB
-  columns parsed to Clojure data and normalized to the OpenAPI response shape
-  (`dimensions` as a keyword-keyed map, `tags` as a vector of strings). Both are
-  defensive against mis-shaped rows so a bad profile reports nothing rather than
-  500ing the read endpoint (see `coerce-dimensions`/`coerce-tags`)."
+  "Coerce a raw row map into a profile: the `dimensions`, `tags`, and
+  `context` JSONB columns parsed to Clojure data and normalized to the
+  OpenAPI response shape (`dimensions` as a keyword-keyed map, `tags` as a
+  vector of strings, `context` as `{:text ... :links [...]}` or nil). All
+  three are defensive against mis-shaped rows so a bad profile reports
+  nothing rather than 500ing the read endpoint (see
+  `coerce-dimensions`/`coerce-tags`/`coerce-context`)."
   [row]
   (when row
     (-> row
         (update :dimensions coerce-dimensions)
-        (update :tags coerce-tags))))
+        (update :tags coerce-tags)
+        (update :context coerce-context))))
 
 (defn- exec-one [ds sql-vec]
   (jdbc/execute-one! ds sql-vec {:builder-fn rs/as-unqualified-lower-maps}))
@@ -112,6 +136,21 @@
           first
           str
           not-empty))
+
+(defn profile-channels
+  "The full list of channel values implied by a profile's `channel`
+   dimension, trimmed and blank-filtered (or nil when the dimension is
+   absent/empty). Unlike `profile-channel` (the legacy single-value
+   accessor used for the COALESCE-based LLM fan-out, which only ever needs
+   the first value), this is used by the force-overwrite manual fan-out
+   (`grout.media.store/force-set-channels-by-tag!`) so a multi-channel
+   reassignment applies every value, not just one."
+  [dimensions]
+  (not-empty (->> (or (:channel dimensions) (get dimensions "channel"))
+                  (map str)
+                  (map str/trim)
+                  (remove str/blank?)
+                  vec)))
 
 (defn growth-exceeded?
   "True when `current-count` has grown more than `threshold-pct` beyond the
@@ -157,20 +196,74 @@
                             WHERE tag_value = ? RETURNING *"
                            tag-value])))
 
+(defn set-manual!
+  "Apply an operator's manual edit to a profile: update whichever of
+   `dimensions`, `tags`, `context`, and `locked` are present as keys in
+   `patch` (an absent key leaves that column unchanged; `nil` clears it).
+   Returns the updated profile, or nil if no profile exists for `tag-value`
+   or `patch` has none of those keys.
+
+   `locked` follows `patch`'s own `:locked` key when present (explicit
+   control — e.g. `{:locked false}` un-locks without touching values).
+   Otherwise, setting `:dimensions` and/or `:tags` implicitly locks the
+   profile, since that is precisely an operator overriding what the LLM (or
+   the vocabulary guard) produced; setting only `:context` leaves `locked`
+   as-is. Status is always left/flipped to `ready` when values are written,
+   since a manual edit is by definition a resolved profile, not a pending
+   one.
+
+   Unlike `mark-ready!` (the LLM-derived write path), this never validates
+   `dimensions` against the configured vocabulary — a manual edit is the
+   operator overriding what that vocabulary guard would otherwise reject."
+  [ds tag-value patch]
+  (let [implicit-lock? (and (not (contains? patch :locked))
+                            (or (contains? patch :dimensions) (contains? patch :tags)))
+        set-map (cond-> {:updated_at [:now]}
+                  (contains? patch :dimensions) (assoc :dimensions (->jsonb (:dimensions patch))
+                                                        :status "ready")
+                  (contains? patch :tags)       (assoc :tags (->jsonb (:tags patch))
+                                                        :status "ready")
+                  (contains? patch :context)    (assoc :context (->jsonb (:context patch)))
+                  (contains? patch :locked)     (assoc :locked (boolean (:locked patch)))
+                  implicit-lock?                (assoc :locked true))]
+    (when (> (count set-map) 1)
+      (->profile (exec-one ds (sql/format {:update :directory_profiles
+                                            :set set-map
+                                            :where [:= :tag_value tag-value]
+                                            :returning [:*]}))))))
+
 (defn mark-ready!
   "Persist a successful enrichment: store `dimensions`/`tags`, record the count
-   at enrichment (for the growth threshold), clear the error/backoff, and flip
-   status to `ready`. Returns the updated profile."
+   at enrichment (for the growth threshold), clear the error/backoff, flip
+   status to `ready`, and clear `locked` — this is the LLM-derived write path,
+   so any previous manual lock (see `set-manual!`) no longer applies once a
+   fresh LLM result has actually landed (an explicit `force=true`
+   re-enrichment is how an operator un-locks a profile). Returns the updated
+   profile."
   [ds tag-value dimensions tags current-count]
   (->profile (exec-one ds ["UPDATE directory_profiles
                             SET status = 'ready',
                                 dimensions = ?, tags = ?,
                                 item_count_at_enrichment = ?,
                                 error = NULL, next_retry_at = NULL,
-                                enrichment_attempts = 0,
+                                enrichment_attempts = 0, locked = false,
                                 last_enrichment_at = now(), updated_at = now()
                             WHERE tag_value = ? RETURNING *"
                            (->jsonb dimensions) (->jsonb tags)
+                           current-count tag-value])))
+
+(defn update-item-count!
+  "Update only `item_count_at_enrichment` (the growth-threshold baseline),
+   touching nothing else — not `status`, `dimensions`, `tags`, or `locked`.
+   Used when a locked profile's existing (unchanged) values get re-applied to
+   newly-tagged media without a fresh LLM call: the growth baseline still
+   needs to move forward so the next threshold check compares against the
+   current count, not the stale one from before the manual edit. Returns the
+   updated profile."
+  [ds tag-value current-count]
+  (->profile (exec-one ds ["UPDATE directory_profiles
+                            SET item_count_at_enrichment = ?, updated_at = now()
+                            WHERE tag_value = ? RETURNING *"
                            current-count tag-value])))
 
 (defn mark-failed!

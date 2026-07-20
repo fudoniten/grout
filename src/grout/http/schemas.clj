@@ -39,7 +39,9 @@
    [:path [:string {:description "Absolute path on the shared mount; stream this directly when co-mounted."}]]
    [:name {:optional true} [:maybe {:description "Human/AI title."} :string]]
    [:description {:optional true} [:maybe {:description "Short description."} :string]]
-   [:channel {:optional true} [:maybe {:description "Owning channel, or null for generic filler usable on any channel."} :string]]
+   [:channel {:optional true} [:maybe {:description "Owning channel (first of `channels`), or null for generic filler usable on any channel."} :string]]
+   [:channels {:optional true} [:maybe {:description "Full set of channels this item may play on. Populated with more than one value only via a directory-profile multi-channel reassignment; a plain single-channel item has this as a one-element list matching `channel`. Null (like `channel`) means channel-agnostic."}
+                                [:vector :string]]]
    [:tags [:vector {:description "Freeform tags used for retrieval."} :string]]
    [:duration-ms [:int {:description "Duration in milliseconds."}]]
    [:width {:optional true} [:maybe {:description "Video width in pixels."} :int]]
@@ -123,6 +125,12 @@
    [:force {:optional true} [:boolean {:description "When true, always re-enrich regardless of the growth threshold."}]]
    [:threshold-pct {:optional true} [:int {:min 0 :description "Re-enrich only when the item count has grown more than this percent since last enrichment (default 20)."}]]])
 
+(def DirectoryProfileManualContext
+  [:map {:title "DirectoryProfileManualContext"
+         :description "Operator-supplied grounding notes for a collection's classification. Threaded into /enrich/profile's prompt as literal text — links are echoed as-is, never fetched or summarized (unlike per-item MediaContext's Wikipedia auto-search)."}
+   [:text {:optional true} [:maybe {:description "Free-form notes about what this collection actually contains, e.g. a correction like 'these are retro VIDEO GAME commercials from the 70s-80s, not vintage film content.'"} :string]]
+   [:links {:optional true} [:vector {:description "Reference URLs, echoed into the prompt as plain text (not fetched)."} :string]]])
+
 (def DirectoryProfile
   [:map {:title "DirectoryProfile"
          :description "State of a directory/tag-group profile."}
@@ -132,11 +140,21 @@
    [:dimensions {:optional true} [:maybe {:description "Derived dimension selections (dimension -> values); null until ready."}
                                   [:map-of :keyword [:vector :string]]]]
    [:tags {:optional true} [:maybe {:description "Derived free-form tags; null until ready."} [:vector :string]]]
+   [:context {:optional true} [:maybe DirectoryProfileManualContext]]
+   [:locked {:optional true} [:boolean {:description "True when dimensions/tags were set by a manual PATCH rather than the LLM; growth-triggered re-enrichment skips calling Tunabrain until this is cleared (see PATCH /grout/directory-profiles/:tag)."}]]
    [:item-count [:int {:description "Current live item count carrying this tag."}]]
    [:item-count-at-enrichment [:int {:description "Item count recorded at the last enrichment."}]]
    [:cached {:optional true} [:boolean {:description "True when returned without a new enrichment."}]]
    [:timed-out {:optional true} [:boolean {:description "True when a wait=true request hit the inline timeout; the worker will finish it."}]]
    [:error {:optional true} [:maybe {:description "Last failure message when status=failed."} :string]]])
+
+(def DirectoryProfilePatch
+  [:map {:title "DirectoryProfilePatch"
+         :description "Manual overrides for PATCH /grout/directory-profiles/:tag. At least one field is required. Provided fields fully replace the corresponding profile field; omitted fields are left unchanged. Setting :dimensions and/or :tags implicitly locks the profile (see :locked) unless :locked is also given explicitly in the same request."}
+   [:dimensions {:optional true} [:map-of :string [:vector :string]]]
+   [:tags {:optional true} [:vector :string]]
+   [:context {:optional true} [:maybe DirectoryProfileManualContext]]
+   [:locked {:optional true} [:boolean {:description "Explicit lock control. true locks without touching dimensions/tags; false un-locks (e.g. to let the next growth-triggered call re-enrich via the LLM again) without touching them either."}]]])
 
 (def DirectoryProfileList
   [:map {:title "DirectoryProfileList"

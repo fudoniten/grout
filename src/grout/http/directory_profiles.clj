@@ -3,9 +3,16 @@
 
    `POST /grout/enrich-by-tag/:tag` ensures a profile exists for the tag and,
    subject to a growth threshold, (re-)enriches it — asynchronously by default
-   (the periodic worker picks it up) or inline when `wait=true`.
+   (the periodic worker picks it up) or inline when `wait=true`. A `locked`
+   profile (see `patch-handler`) is skipped for LLM re-enrichment unless
+   `force=true`; a grown locked profile still gets its existing values
+   fanned out to newly-tagged rows.
 
    `GET /grout/directory-profiles/:tag` reads a profile's current state.
+
+   `PATCH /grout/directory-profiles/:tag` applies a manual operator
+   correction — dimensions, tags, and/or grounding context — bypassing the
+   LLM entirely.
 
    The endpoint is tag-agnostic: `:tag` is any tag value (in v1 always a
    `parent-directory:<x>` tag written by `grout-cli --upload-dir`)."
@@ -27,6 +34,8 @@
            :concept-name              (:concept_name profile)
            :dimensions                (:dimensions profile)
            :tags                      (:tags profile)
+           :context                   (:context profile)
+           :locked                    (boolean (:locked profile))
            :item-count                item-count
            :item-count-at-enrichment  (or (:item_count_at_enrichment profile) 0)}
     (some? cached)      (assoc :cached cached)
@@ -36,11 +45,18 @@
 (defn enrich-by-tag-handler
   "POST /grout/enrich-by-tag/:tag. Body: {:concept-name (required) :wait? :force?
    :threshold-pct?}. Ensures the profile exists, then:
+     * when `locked` and not forced: never calls the LLM. Re-applies the
+       existing (unchanged) dimensions/tags/channels to any newly-tagged rows
+       once growth exceeds the threshold (bumping the growth baseline so this
+       doesn't re-run on every request), otherwise just returns the cached
+       state;
      * returns the cached `ready` profile when growth is under threshold and not
        forced;
      * otherwise flips it to `pending` (worker enriches on its next tick) and
        returns 202 — or, when `wait=true`, enriches inline (bounded by a 30s
-       timeout) and returns the result."
+       timeout) and returns the result. Either path clears `locked` once a
+       fresh LLM result actually lands (see `grout.directory-profiles/mark-ready!`),
+       so `force=true` doubles as the un-lock mechanism."
   [{:keys [ds tunabrain dim-config sample-count]}]
   (fn [{{{:keys [tag]} :path body :body} :parameters}]
     (let [{:keys [wait force threshold-pct concept-name]} body
@@ -57,6 +73,23 @@
               (dp/ensure-profile! ds tag concept-name)
               (let [profile (dp/get-profile-for-tag ds tag)]
                 (cond
+                  ;; Locked (manual override) and not forced: never call the
+                  ;; LLM. If the group has grown past the threshold, re-apply
+                  ;; the existing dimensions/tags/channels to any newly-tagged
+                  ;; rows (COALESCE fan-out — new rows only, never clobbers an
+                  ;; already-corrected one) and bump the growth baseline;
+                  ;; otherwise just return the cached state.
+                  (and (not force) (= "ready" (:status profile)) (:locked profile))
+                  (let [profile' (if (dp/growth-exceeded? profile current threshold)
+                                   (do (store/apply-directory-profile!
+                                        ds tag
+                                        (dp/profile->tags (:dimensions profile) (:tags profile))
+                                        []
+                                        (dp/profile-channels (:dimensions profile)))
+                                       (dp/update-item-count! ds tag current))
+                                   profile)]
+                    {:status 200 :body (profile->body profile' current {:cached true})})
+
                   ;; Fresh enough — no LLM call.
                   (and (not force)
                        (= "ready" (:status profile))
@@ -79,6 +112,46 @@
                   (let [pending (dp/mark-pending! ds tag)]
                     (log/info "Directory profile queued for enrichment" {:tag tag :items current})
                     {:status 202 :body (profile->body pending current {:cached false})}))))))))))
+
+(defn- context-patch->stored
+  "Normalize a PATCH body's `:context` (a DirectoryProfileManualContext map,
+   or nil to clear) before persisting. An empty map (`{}` — no `:text`, no
+   `:links`) is treated the same as nil: an operator PATCHing `{:context {}}`
+   plainly means \"no context\", not \"context set to nothing in particular\"."
+  [context]
+  (when (and context
+             (or (not (str/blank? (str (:text context))))
+                 (seq (:links context))))
+    context))
+
+(defn patch-handler
+  "PATCH /grout/directory-profiles/:tag. Body: any of `:dimensions`, `:tags`,
+   `:context`, `:locked` (see DirectoryProfilePatch; at least one required).
+
+   Applies the operator's manual edit via `dp/set-manual!` and, when
+   `:dimensions` and/or `:tags` were provided, immediately fans the new
+   values out to every child media row via
+   `store/force-set-channels-by-tag!` — an UNCONDITIONAL overwrite (unlike
+   the LLM-driven fan-out's COALESCE/never-clobber semantics), because the
+   whole point of a manual edit is correcting an already-wrong assignment,
+   not just filling blanks. This takes effect immediately rather than
+   waiting for the next growth-triggered sweep."
+  [{:keys [ds]}]
+  (fn [{{{:keys [tag]} :path body :body} :parameters}]
+    (let [patch (cond-> (select-keys body [:dimensions :tags :context :locked])
+                  (contains? body :context) (update :context context-patch->stored))]
+      (if (empty? patch)
+        {:status 400 :body {:error "No mutable fields provided"}}
+        (if-let [old-profile (dp/get-profile-for-tag ds tag)]
+          (let [updated (dp/set-manual! ds tag patch)]
+            (when (or (contains? patch :dimensions) (contains? patch :tags))
+              (let [old-tags   (dp/profile->tags (:dimensions old-profile) (:tags old-profile))
+                    new-tags   (dp/profile->tags (:dimensions updated) (:tags updated))
+                    stale-tags (vec (remove (set new-tags) old-tags))
+                    channels   (dp/profile-channels (:dimensions updated))]
+                (store/force-set-channels-by-tag! ds tag new-tags stale-tags channels)))
+            {:status 200 :body (profile->body updated (store/count-by-tag ds tag) {:cached false})})
+          {:status 404 :body {:error "No profile exists for this tag"}})))))
 
 (defn get-profile-handler
   "GET /grout/directory-profiles/:tag — read a profile's current state."

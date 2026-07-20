@@ -280,6 +280,14 @@
                         no channel vocabulary and routinely invents a
                         description-word (`educational`, `thriller`)
                         that the controlled-vocabulary guard drops.
+    :context          — optional `{:text ... :links [...]}` operator-supplied
+                        grounding notes for the group (see
+                        `grout.directory-profiles`'s `context` column), e.g.
+                        a correction like \"these are retro VIDEO GAME ads,
+                        not vintage film content\". Sent as the `:context`
+                        field; Tunabrain threads it into the prompt verbatim
+                        — it is NOT fetched/summarized the way per-item
+                        `MediaContext` links are.
 
   Returns a map:
     `:concept-name`     — echoed back
@@ -290,21 +298,23 @@
 
   Throws on HTTP error, connection refused, or unknown host — the caller
   (directory worker) catches and marks the profile failed for retry."
-  [client concept-name sample-filenames & {:keys [sample-count dim-config]}]
+  [client concept-name sample-filenames & {:keys [sample-count dim-config context]}]
   (let [filenames (vec sample-filenames)
         payload   (cond-> {:concept_name     concept-name
                            :sample_filenames filenames
                            :sample_count     (or sample-count (count filenames))}
-                    (seq dim-config) (assoc :categories (build-categories dim-config)))
+                    (seq dim-config) (assoc :categories (build-categories dim-config))
+                    (seq context)    (assoc :context context))
         resp      (json-post! client "/enrich/profile" payload)]
     (when-not (map? resp)
       (throw (ex-info "Tunabrain /enrich/profile returned non-map"
                       {:response resp})))
-    (log/info (format "Enrich profile '%s': %d dimensions, %d tags%s"
+    (log/info (format "Enrich profile '%s': %d dimensions, %d tags%s%s"
                       concept-name
                       (count (:dimensions resp))
                       (count (:tags resp))
-                      (if (seq dim-config) " (with categories)" "")))
+                      (if (seq dim-config) " (with categories)" "")
+                      (if (seq context) " (with operator context)" "")))
     {:concept-name     (:concept_name resp)
      :dimensions       (or (:dimensions resp) {})
      :tags             (vec (or (:tags resp) []))
