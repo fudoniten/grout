@@ -43,6 +43,20 @@
   (is (nil? (dp/profile-channel {:channel [""]})))
   (is (nil? (dp/profile-channel nil))))
 
+;; --- profile-channels (multi-value accessor, for the force-fanout path) ----
+
+(deftest profile-channels-returns-full-trimmed-list
+  (is (= ["toontown" "infobytes" "galaxy"]
+         (dp/profile-channels {:channel ["toontown" "infobytes" "galaxy"]})))
+  (is (= ["muse"] (dp/profile-channels {"channel" ["muse"]})))
+  (is (= ["muse"] (dp/profile-channels {:channel [" muse " ""]}))))
+
+(deftest profile-channels-nil-when-absent-or-blank
+  (is (nil? (dp/profile-channels {})))
+  (is (nil? (dp/profile-channels {:channel []})))
+  (is (nil? (dp/profile-channels {:channel [""]})))
+  (is (nil? (dp/profile-channels nil))))
+
 ;; --- growth-exceeded? -------------------------------------------------------
 
 (deftest growth-exceeded-triggers-above-threshold
@@ -110,3 +124,31 @@
 
 (deftest ->profile-preserves-nil-tags
   (is (nil? (-> (dp/->profile {:dimensions {} :tags nil}) :tags))))
+
+;; --- ->profile: context coercion ---------------------------------------------
+
+(deftest ->profile-coerces-context-with-text-and-links
+  (is (= {:text "these are retro game ads" :links ["https://example.com/a"]}
+         (-> (dp/->profile {:dimensions {} :tags []
+                            :context {"text" "these are retro game ads"
+                                      "links" ["https://example.com/a"]}})
+             :context))
+      "string-keyed context (as jsonb round-trips) is normalized to keywords"))
+
+(deftest ->profile-context-drops-blank-links-and-trims-text
+  (is (= {:text "hi" :links ["a"]}
+         (-> (dp/->profile {:dimensions {} :tags []
+                            :context {:text "  hi  " :links ["a" "" "  "]}})
+             :context))))
+
+(deftest ->profile-context-nil-when-empty-or-absent
+  (is (nil? (-> (dp/->profile {:dimensions {} :tags [] :context nil}) :context)))
+  (is (nil? (-> (dp/->profile {:dimensions {} :tags [] :context {}}) :context))
+      "an entirely-empty context object is the same as no context")
+  (is (nil? (-> (dp/->profile {:dimensions {} :tags []
+                               :context {:text "" :links []}})
+                :context))
+      "blank text + no links collapses to nil"))
+
+(deftest ->profile-context-nil-for-mis-shaped-value
+  (is (nil? (-> (dp/->profile {:dimensions {} :tags [] :context "not a map"}) :context))))

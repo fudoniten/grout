@@ -61,6 +61,15 @@
   [xs]
   [:cast [:array (vec xs)] [:raw "text[]"]])
 
+(defn- channels-for
+  "Derive the `channels` array value that mirrors a legacy singular
+   `:channel` value: a one-element `text[]` when non-blank, else nil (SQL
+   NULL) — nil, not an empty array, so `channel IS NULL AND channels IS
+   NULL` keeps meaning \"channel-agnostic\" (see `->query-sqlmap`)."
+  [channel]
+  (when-not (str/blank? channel)
+    (text-array [channel])))
+
 (def ^:private insertable-keys
   [:kind :path :content_hash :name :description :channel :tags :duration_ms
    :width :height :vcodec :acodec :source :source_url :enriched])
@@ -75,10 +84,13 @@
 
 (defn create!
   "Insert a media row and return it. `m` uses snake_case column keywords;
-   `:tags` (if present) is a vector of strings."
+   `:tags` (if present) is a vector of strings. `:channels` is derived from
+   `:channel` (see `channels-for`) — intake is always single-channel; only a
+   directory-profile manual reassignment writes more than one channel."
   [ds m]
   (let [row (-> (select-keys m insertable-keys)
-                (assoc :tags (text-array (:tags m []))))]
+                (assoc :tags (text-array (:tags m [])))
+                (assoc :channels (channels-for (:channel m))))]
     (exec-one ds {:insert-into :grout_media
                   :values [row]
                   :returning [:*]})))
@@ -104,10 +116,12 @@
 
 (defn update-fields!
   "Set arbitrary columns on a row by id and return it. `:tags` (if present) is
-   coerced to text[]. Intended for intake dedup (retag/revive)."
+   coerced to text[]. `:channel` (if present) also refreshes `:channels` to
+   match (see `channels-for`). Intended for intake dedup (retag/revive)."
   [ds id fields]
   (let [set-map (cond-> fields
-                  (contains? fields :tags) (assoc :tags (text-array (:tags fields))))]
+                  (contains? fields :tags)    (assoc :tags (text-array (:tags fields)))
+                  (contains? fields :channel) (assoc :channels (channels-for (:channel fields))))]
     (exec-one ds {:update :grout_media
                   :set    set-map
                   :where  [:= :id id]
@@ -125,13 +139,22 @@
    pages. The non-random order carries an `id` tiebreaker so equal
    `created_at` values order deterministically across pages.
 
-   Channel semantics: a channel filter matches the given channel OR
-   generic (null-channel) items, which are usable on any channel."
+   Channel semantics: a channel filter matches the given channel (via the
+   legacy singular column OR containment in the new multi-channel `channels`
+   array) OR a generic item — one with BOTH `channel` and `channels` unset,
+   which is usable on any channel. (Requiring both unset, rather than just
+   `channel IS NULL`, matters once a row's `channels` is populated with more
+   than one value by a directory-profile reassignment: such a row is
+   restricted to that specific set, not generic, even if its legacy
+   `channel` column happens to be null.)"
   [{:keys [channel tags min-ms max-ms kind limit offset random include-superseded?]
     :or   {limit 10}}]
   (let [conds (cond-> []
                 (not include-superseded?) (conj [:= :superseded_at nil])
-                channel    (conj [:or [:= :channel channel] [:= :channel nil]])
+                channel    (conj [:or
+                                  [:= :channel channel]
+                                  [at>-op :channels (text-array [channel])]
+                                  [:and [:= :channel nil] [:= :channels nil]]])
                 (seq tags) (conj [at>-op :tags (text-array tags)])
                 min-ms     (conj [:>= :duration_ms min-ms])
                 max-ms     (conj [:<= :duration_ms max-ms])
@@ -149,11 +172,17 @@
 
 (defn update-metadata!
   "Patch mutable metadata (name/description/channel/tags) on a live row.
-   Returns the updated row, or nil when the row is absent/superseded or the
-   patch has no recognised fields."
+   Setting `:channel` also refreshes `:channels` to match (see
+   `channels-for`) — an explicit single-channel PATCH is a real, authoritative
+   assignment, so it replaces whatever `:channels` set a directory-profile
+   fan-out may have previously written (e.g. reassigning a multi-channel item
+   back down to one channel, or to generic via `:channel nil`). Returns the
+   updated row, or nil when the row is absent/superseded or the patch has no
+   recognised fields."
   [ds id patch]
   (let [set-map (cond-> (select-keys patch [:name :description :channel])
-                  (contains? patch :tags) (assoc :tags (text-array (:tags patch))))]
+                  (contains? patch :tags)    (assoc :tags (text-array (:tags patch)))
+                  (contains? patch :channel) (assoc :channels (channels-for (:channel patch))))]
     (when (seq set-map)
       (exec-one ds {:update :grout_media
                     :set    set-map
@@ -308,6 +337,15 @@
        (keep row->filename)
        vec))
 
+(defn- pg-text-array-or-nil
+  "Like `pg-text-array`, but an empty/nil collection yields SQL NULL instead
+   of the empty-array literal `{}`. Needed anywhere a NULL `channels` still
+   has to mean \"unset\" (see `->query-sqlmap`'s generic-item check) —
+   `pg-text-array`'s `{}` would instead read as \"assigned to zero channels\",
+   a different (and here, wrong) thing."
+  [xs]
+  (when (seq xs) (pg-text-array xs)))
+
 (defn apply-directory-profile!
   "Fan a directory profile out to every live row carrying `tag-value`.
 
@@ -315,25 +353,69 @@
     * unions `profile-tags` (the dimension-as-tag expansion + free-form tags)
       into each row's `tags`, removing any `stale-tags` (tags applied by a
       previous version of this profile that the new one no longer includes),
-    * COALESCE-fills the `channel` column from `channel` (never clobbers a
-      channel set at intake), and
+    * COALESCE-fills `channel` (first of `channels`, for old consumers) and
+      `channels` (the full list) — never clobbers a channel/channels set at
+      intake, and
     * marks the rows `enriched=true`.
 
   `stale-tags` should be (old-profile-tags \\ new-profile-tags) so a re-enrich
   that drops a tag also removes it from already-stamped rows, while tags the new
-  profile keeps are preserved. Returns the number of rows updated."
-  [ds tag-value profile-tags stale-tags channel]
+  profile keeps are preserved. `channels` is the directory profile's `channel`
+  dimension values (see `grout.directory-profiles/profile-channels`) — usually
+  one value, since the enrichment prompt asks the model for a single best
+  channel, but threaded through as a list either way. Returns the number of
+  rows updated.
+
+  This is the LLM-derived (COALESCE, never-clobber) fan-out. A manual
+  operator correction that must override an already-wrong channel needs
+  `force-set-channels-by-tag!` instead."
+  [ds tag-value profile-tags stale-tags channels]
   (let [result (jdbc/execute-one! ds
                  [(str "UPDATE grout_media "
                        "SET tags = (SELECT array(SELECT DISTINCT x "
                        "                         FROM unnest(array_cat(tags, ?::text[])) AS x "
                        "                         WHERE x <> ALL(?::text[]))), "
                        "    channel = COALESCE(channel, ?::text), "
+                       "    channels = COALESCE(channels, ?::text[]), "
                        "    enriched = true "
                        "WHERE superseded_at IS NULL AND tags @> ?::text[]")
                   (pg-text-array profile-tags)
                   (pg-text-array stale-tags)
-                  channel
+                  (first channels)
+                  (pg-text-array-or-nil channels)
+                  (pg-text-array [tag-value])]
+                 {:builder-fn rs/as-unqualified-lower-maps})]
+    (:next.jdbc/update-count result)))
+
+(defn force-set-channels-by-tag!
+  "Like `apply-directory-profile!`, but UNCONDITIONALLY overwrites `channel`/
+  `channels` on every live row carrying `tag-value` instead of only filling
+  them when unset. This is the manual-override fan-out: an operator has
+  explicitly corrected a directory profile's channel assignment (e.g. a
+  directory of retro game-ad commercials wrongly landed on `goldenreels`),
+  and every already-tagged row needs the fix applied, not just newly-added
+  ones that happen to still have a null channel.
+
+  An empty/nil `channels` clears both columns (channel-agnostic), which is
+  correct when the operator's edit no longer claims a `channel` dimension at
+  all — not a bug to guard against.
+
+  Also unions in `profile-tags`/removes `stale-tags` and marks `enriched`,
+  same as `apply-directory-profile!`. Returns the number of rows updated."
+  [ds tag-value profile-tags stale-tags channels]
+  (let [result (jdbc/execute-one! ds
+                 [(str "UPDATE grout_media "
+                       "SET tags = (SELECT array(SELECT DISTINCT x "
+                       "                         FROM unnest(array_cat(tags, ?::text[])) AS x "
+                       "                         WHERE x <> ALL(?::text[]))), "
+                       "    channel = ?::text, "
+                       "    channels = ?::text[], "
+                       "    enriched = true "
+                       "WHERE superseded_at IS NULL AND tags @> ?::text[]")
+                  (pg-text-array profile-tags)
+                  (pg-text-array stale-tags)
+                  (first channels)
+                  (pg-text-array-or-nil channels)
                   (pg-text-array [tag-value])]
                  {:builder-fn rs/as-unqualified-lower-maps})]
     (:next.jdbc/update-count result)))

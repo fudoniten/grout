@@ -16,7 +16,9 @@
                            :kind "bumper"
                            :limit 5})]
     (is (re-find #"superseded_at IS NULL" q) "excludes superseded by default")
-    (is (re-find #"channel = \? OR channel IS NULL" q) "channel OR generic")
+    (is (re-find #"channel = \?" q) "legacy exact channel match")
+    (is (re-find #"channels @> CAST\(ARRAY" q) "multi-channel containment match")
+    (is (re-find #"channel IS NULL AND channels IS NULL" q) "generic = both unset")
     (is (re-find #"tags @> CAST\(ARRAY" q) "tag AND via containment")
     (is (re-find #"duration_ms >= \?" q) "min duration inclusive")
     (is (re-find #"duration_ms <= \?" q) "max duration inclusive")
@@ -63,6 +65,22 @@
     (is (re-find #"(?i)limit" q))
     (is (some #{10} params))))
 
+;; --- multi-channel query semantics ------------------------------------------
+
+(deftest channel-filter-omitted-when-no-channel-param
+  ;; No channel filter at all -- neither the legacy nor multi-channel clause
+  ;; should appear; every item (generic or channel-assigned) matches.
+  (let [[q] (fmt {})]
+    (is (not (re-find #"channels" q)))))
+
+(deftest channel-filter-matches-legacy-or-multi-or-generic
+  (let [[q & params] (fmt {:channel "toontown"})]
+    (is (re-find #"channel = \?" q))
+    (is (re-find #"channels @> CAST\(ARRAY\[\?\] AS text\[\]\)" q))
+    (is (re-find #"channel IS NULL AND channels IS NULL" q))
+    (is (= 2 (count (filter #{"toontown"} params)))
+        "the channel param is bound twice: legacy exact match + containment check")))
+
 ;; --- tag-group (directory) helpers -----------------------------------------
 
 (deftest pg-text-array-formats-array-literal
@@ -73,6 +91,25 @@
 (deftest pg-text-array-quotes-protect-special-chars
   ;; Double-quoting each element keeps commas/spaces inside a single element.
   (is (= "{\"a,b\",\"c\"}" (#'store/pg-text-array ["a,b" "c"]))))
+
+(deftest pg-text-array-or-nil-distinguishes-unset-from-empty
+  ;; Unlike pg-text-array (which renders "{}" for an empty collection),
+  ;; pg-text-array-or-nil must produce nil (SQL NULL) for empty/nil input --
+  ;; the query layer's "generic = both channel and channels unset" check
+  ;; depends on channels being truly NULL, not an empty array.
+  (is (nil? (#'store/pg-text-array-or-nil [])))
+  (is (nil? (#'store/pg-text-array-or-nil nil)))
+  (is (= "{\"toontown\"}" (#'store/pg-text-array-or-nil ["toontown"]))))
+
+;; --- channels-for (single-channel -> channels[] mirror) --------------------
+
+(deftest channels-for-wraps-a-non-blank-channel
+  (is (= [:cast [:array ["toontown"]] [:raw "text[]"]]
+         (#'store/channels-for "toontown"))))
+
+(deftest channels-for-nil-for-blank-or-nil
+  (is (nil? (#'store/channels-for nil)))
+  (is (nil? (#'store/channels-for ""))))
 
 (deftest row->filename-prefers-filename-tag
   (is (= "foo.mp4"

@@ -44,7 +44,8 @@
           (let [resp        (tb/request-enrich-profile! tunabrain (:concept_name profile)
                                                         samples
                                                         :sample-count sample-count
-                                                        :dim-config   dim-config)
+                                                        :dim-config   dim-config
+                                                        :context      (:context profile))
                 {dimensions :dimensions rejected :rejected}
                 (dim/filter-dimension-map dim-config (:dimensions resp))
                 _           (dim/log-rejected! rejected {:tag tag-value})
@@ -56,11 +57,11 @@
                   (dp/mark-failed! ds tag-value "enrichment produced no dimensions or tags"))
               (let [old-tags   (dp/profile->tags (:dimensions profile) (:tags profile))
                     stale-tags (vec (remove (set new-tags) old-tags))
-                    channel    (dp/profile-channel dimensions)
-                    n          (store/apply-directory-profile! ds tag-value new-tags stale-tags channel)]
+                    channels   (dp/profile-channels dimensions)
+                    n          (store/apply-directory-profile! ds tag-value new-tags stale-tags channels)]
                 (log/info "Directory profile applied"
                           {:tag tag-value :rows n :dimensions (count dimensions)
-                           :tags (count free-tags) :channel channel})
+                           :tags (count free-tags) :channels channels})
                 (dp/mark-ready! ds tag-value dimensions free-tags
                                 (store/count-by-tag ds tag-value)))))))
       (catch Exception e

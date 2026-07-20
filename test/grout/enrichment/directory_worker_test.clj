@@ -21,9 +21,9 @@
                                                   (is (= "Adam Neely Music" concept))
                                                   {:dimensions {:channel ["muse"]}
                                                    :tags ["jazz"] :warnings []})
-                  store/apply-directory-profile! (fn [_ tag new-tags stale channel]
+                  store/apply-directory-profile! (fn [_ tag new-tags stale channels]
                                                    (reset! applied {:tag tag :new-tags new-tags
-                                                                    :stale stale :channel channel})
+                                                                    :stale stale :channels channels})
                                                    3)
                   store/count-by-tag            (fn [_ _] 3)
                   dp/mark-ready!                (fn [_ tag dims tags cnt]
@@ -32,11 +32,42 @@
       (let [res (dworker/enrich-profile-one! :ds :tb {} 5 "parent-directory:x")]
         (is (= "ready" (:status res)))
         (is (= "parent-directory:x" (:tag @applied)))
-        (is (= "muse" (:channel @applied)))
+        (is (= ["muse"] (:channels @applied)))
         (is (= #{"channel:muse" "jazz"} (set (:new-tags @applied))))
         (is (= [] (:stale @applied)) "no prior profile => nothing stale")
         (is (= {:channel ["muse"]} (:dims @ready)))
         (is (= 3 (:cnt @ready)))))))
+
+(deftest enrich-one-threads-profile-context-to-tunabrain
+  (let [sent-context (atom ::not-called)]
+    (with-redefs [dp/get-profile-for-tag        (fn [_ _] {:concept_name "C"
+                                                           :dimensions nil :tags nil :status "pending"
+                                                           :context {:text "these are retro game ads"}})
+                  store/sample-filenames-by-tag (fn [_ _ _] ["a.mp4"])
+                  tb/request-enrich-profile!    (fn [_ _ _ & {:keys [context]}]
+                                                  (reset! sent-context context)
+                                                  {:dimensions {:channel ["toontown"]} :tags ["retro"] :warnings []})
+                  store/apply-directory-profile! (fn [& _] 1)
+                  store/count-by-tag            (fn [_ _] 1)
+                  dp/mark-ready!                (fn [& _] {:status "ready"})]
+      (dworker/enrich-profile-one! :ds :tb {} 5 "t")
+      (is (= {:text "these are retro game ads"} @sent-context)))))
+
+(deftest enrich-one-applies-multiple-channel-values
+  ;; A manually-broadened profile (or, in principle, a model that returns
+  ;; more than one channel value) fans out its FULL channel list, not just
+  ;; the first -- profile-channels, not the legacy profile-channel.
+  (let [applied (atom nil)]
+    (with-redefs [dp/get-profile-for-tag        (fn [_ _] {:concept_name "C"
+                                                           :dimensions nil :tags nil :status "pending"})
+                  store/sample-filenames-by-tag (fn [_ _ _] ["a.mp4"])
+                  tb/request-enrich-profile!    (fn [& _] {:dimensions {:channel ["toontown" "infobytes" "galaxy"]}
+                                                           :tags ["retro"] :warnings []})
+                  store/apply-directory-profile! (fn [_ _ _ _ channels] (reset! applied channels) 1)
+                  store/count-by-tag            (fn [_ _] 1)
+                  dp/mark-ready!                (fn [& _] {:status "ready"})]
+      (dworker/enrich-profile-one! :ds :tb {} 5 "t")
+      (is (= ["toontown" "infobytes" "galaxy"] @applied)))))
 
 (deftest enrich-one-drops-hallucinated-channel-before-fanout
   ;; The model invents a channel outside the configured vocabulary. It must
@@ -49,16 +80,16 @@
                   store/sample-filenames-by-tag (fn [_ _ _] ["a.mp4"])
                   tb/request-enrich-profile!    (fn [& _] {:dimensions {:channel ["muse" "madeup"]}
                                                            :tags ["jazz"] :warnings []})
-                  store/apply-directory-profile! (fn [_ tag new-tags stale channel]
+                  store/apply-directory-profile! (fn [_ tag new-tags stale channels]
                                                    (reset! applied {:tag tag :new-tags new-tags
-                                                                    :stale stale :channel channel})
+                                                                    :stale stale :channels channels})
                                                    1)
                   store/count-by-tag            (fn [_ _] 1)
                   dp/mark-ready!                (fn [_ _ dims tags _]
                                                   (reset! ready {:dims dims :tags tags})
                                                   {:status "ready"})]
       (dworker/enrich-profile-one! :ds :tb dim-config 5 "t")
-      (is (= "muse" (:channel @applied)) "channel column set only from the valid value")
+      (is (= ["muse"] (:channels @applied)) "channels set only from the valid value")
       (is (= #{"channel:muse" "jazz"} (set (:new-tags @applied)))
           "hallucinated 'channel:madeup' never becomes a tag")
       (is (= {:channel ["muse"]} (:dims @ready))
