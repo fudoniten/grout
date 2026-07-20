@@ -148,20 +148,20 @@
   ;; unreachable, we throw — the safer failure mode than starting
   ;; with an empty catalog (which would silently degrade AI quality).
   ;;
-  ;; The channel descriptions fetch is best-effort: a 404 (older
+  ;; The value descriptions fetch is best-effort: a 404 (older
   ;; Tunarr Scheduler without the new endpoint) falls back to the
-  ;; static `:channel` description. A failed fetch never aborts
+  ;; static whole-dimension descriptions. A failed fetch never aborts
   ;; startup — the catalog still loads.
   (if-not client
     (do (log/warn "TUNARR_SCHEDULER_URL not set; enrichment will skip /categorize (only /tags will run)")
         {})
     (try
-      (let [channel-descs (tunarr-scheduler/fetch-channel-descriptions! client)
-            catalog       (tunarr-scheduler/fetch-dimensions-with-retry!
-                           client descriptions channel-descs)]
+      (let [value-descs (tunarr-scheduler/fetch-value-descriptions! client)
+            catalog     (tunarr-scheduler/fetch-dimensions-with-retry!
+                         client descriptions value-descs)]
         (log/info "Dimension catalog loaded"
                   {:dimensions (count catalog)
-                   :channel-descriptions (count channel-descs)})
+                   :dimensions-with-value-descriptions (count value-descs)})
         catalog)
       (catch Exception e
         (log/error e "Failed to fetch dimensions from Tunarr Scheduler at startup; enrichment will skip /categorize")

@@ -117,73 +117,76 @@
           #"connection refused"
           (ts/fetch-dimensions! cl dim-descriptions)))))
 
-;; --- fetch-channel-descriptions! --------------------------------------------
+;; --- fetch-value-descriptions! ----------------------------------------------
 
-(deftest fetch-channel-descriptions-returns-value-description-map
+(deftest fetch-value-descriptions-returns-per-dimension-value-description-map
   (let [descriptions-body (json/generate-string
-                            {:values [{:value "toontown"  :description "Animated content..."}
-                                      {:value "infobytes" :description "Science & technology"}
-                                      {:value "spotlight" :description "All movies, all the time."}]})
-        responses         {(str endpoint "/api/dimensions/channel/descriptions")
+                            {:dimensions
+                             {:channel  {:description ""
+                                         :values [{:value "toontown"  :description "Animated content..."}
+                                                  {:value "infobytes" :description "Science & technology"}
+                                                  {:value "spotlight" :description "All movies, all the time."}]}
+                              :audience {:description "Who this is for"
+                                         :values [{:value "kids" :description "Appropriate for young children"}]}}})
+        responses         {(str endpoint "/api/dimensions/descriptions")
                            {:status 200 :body descriptions-body}}]
     (with-redefs [http/get (fake-get responses)]
-      (let [result (ts/fetch-channel-descriptions! cl)]
-        (is (= 3 (count result)))
-        (is (= "Animated content..." (get result "toontown")))
-        (is (= "Science & technology" (get result "infobytes")))
-        (is (= "All movies, all the time." (get result "spotlight")))))))
+      (let [result (ts/fetch-value-descriptions! cl)]
+        (is (= #{:channel :audience} (set (keys result))))
+        (is (= "Animated content..." (get-in result [:channel "toontown"])))
+        (is (= "Science & technology" (get-in result [:channel "infobytes"])))
+        (is (= "All movies, all the time." (get-in result [:channel "spotlight"])))
+        (is (= "Appropriate for young children" (get-in result [:audience "kids"])))))))
 
-(deftest fetch-channel-descriptions-keeps-empty-descriptions-not-drops-them
+(deftest fetch-value-descriptions-keeps-empty-descriptions-not-drops-them
   (let [descriptions-body (json/generate-string
-                            {:values [{:value "toontown"  :description "Animated"}
-                                      {:value "blank-one" :description ""}]})
-        responses         {(str endpoint "/api/dimensions/channel/descriptions")
+                            {:dimensions
+                             {:channel {:description ""
+                                        :values [{:value "toontown"  :description "Animated"}
+                                                 {:value "blank-one" :description ""}]}}})
+        responses         {(str endpoint "/api/dimensions/descriptions")
                            {:status 200 :body descriptions-body}}]
     (with-redefs [http/get (fake-get responses)]
-      (let [result (ts/fetch-channel-descriptions! cl)]
-        (is (= 2 (count result)) "blank-description channels stay in the controlled vocabulary")
-        (is (= "" (get result "blank-one")))))))
+      (let [result (ts/fetch-value-descriptions! cl)]
+        (is (= 2 (count (:channel result))) "blank-description values stay in the controlled vocabulary")
+        (is (= "" (get-in result [:channel "blank-one"])))))))
 
-(deftest fetch-channel-descriptions-returns-empty-map-on-404
+(deftest fetch-value-descriptions-returns-empty-map-on-404
   (with-redefs [http/get (constantly {:status 404 :body "no such endpoint"})]
-    (let [result (ts/fetch-channel-descriptions! cl)]
-      (is (= {} result) "404 → empty map so callers fall back to the static :channel description"))))
+    (let [result (ts/fetch-value-descriptions! cl)]
+      (is (= {} result) "404 → empty map so callers fall back to the static dimension descriptions"))))
 
-(deftest fetch-channel-descriptions-returns-empty-map-on-empty-payload
-  (with-redefs [http/get (constantly {:status 200 :body (json/generate-string {:values []})})]
-    (let [result (ts/fetch-channel-descriptions! cl)]
-      (is (= {} result) "empty values → empty map, not a crash"))))
+(deftest fetch-value-descriptions-returns-empty-map-on-empty-payload
+  (with-redefs [http/get (constantly {:status 200 :body (json/generate-string {:dimensions {}})})]
+    (let [result (ts/fetch-value-descriptions! cl)]
+      (is (= {} result) "empty dimensions map → empty map, not a crash"))))
 
-(deftest fetch-channel-descriptions-propagates-non-404-http-errors
+(deftest fetch-value-descriptions-propagates-non-404-http-errors
   (with-redefs [http/get (constantly {:status 503 :body "unavailable"})]
     (is (thrown-with-msg?
           clojure.lang.ExceptionInfo
           #"503"
-          (ts/fetch-channel-descriptions! cl))
+          (ts/fetch-value-descriptions! cl))
         "non-404 HTTP failures should propagate so callers can retry")))
 
-;; --- fetch-dimensions! with channel-descriptions ---------------------------
+;; --- fetch-dimensions! with value-descriptions ------------------------------
 
-(deftest fetch-dimensions-embeds-channel-descriptions-in-channel-category
+(deftest fetch-dimensions-embeds-value-descriptions-in-channel-category
   (let [audience-body (json/generate-string
                         {:values [{:value "kids" :usage-count 10}]})
         channel-body  (json/generate-string
                         {:values [{:value "goldenreels" :usage-count 50}
                                   {:value "toontown"    :usage-count 30}]})
-        descs-body    (json/generate-string
-                        {:values [{:value "toontown"    :description "Animated content"}
-                                  {:value "goldenreels" :description "Classic films"}]})
         catalog-body  (json/generate-string
                         {:dimensions [{:name "audience" :value-count 1}
                                       {:name "channel"  :value-count 2}]})
-        responses     {(str endpoint "/api/dimensions")                       {:status 200 :body catalog-body}
-                       (str endpoint "/api/dimensions/audience/values")        {:status 200 :body audience-body}
-                       (str endpoint "/api/dimensions/channel/values")         {:status 200 :body channel-body}
-                       (str endpoint "/api/dimensions/channel/descriptions")   {:status 200 :body descs-body}}]
+        responses     {(str endpoint "/api/dimensions")                {:status 200 :body catalog-body}
+                       (str endpoint "/api/dimensions/audience/values") {:status 200 :body audience-body}
+                       (str endpoint "/api/dimensions/channel/values")  {:status 200 :body channel-body}}]
     (with-redefs [http/get (fake-get responses)]
       (let [result    (ts/fetch-dimensions! cl dim-descriptions
-                                            {"toontown" "Animated content"
-                                             "goldenreels" "Classic films"})
+                                            {:channel {"toontown" "Animated content"
+                                                       "goldenreels" "Classic films"}})
             channel-desc (get-in result [:channel :description])]
         (is (clojure.string/includes? channel-desc "toontown: Animated content")
             "channel description embeds each value with its TS description")
@@ -191,22 +194,39 @@
         (is (= ["goldenreels" "toontown"] (get-in result [:channel :values]))
             "values list is unchanged regardless of descriptions")))))
 
-(deftest fetch-dimensions-channel-falls-back-when-descriptions-map-empty
+(deftest fetch-dimensions-embeds-value-descriptions-for-non-channel-dimension
+  (let [audience-body (json/generate-string
+                        {:values [{:value "kids" :usage-count 10}
+                                  {:value "teen" :usage-count 5}]})
+        catalog-body  (json/generate-string
+                        {:dimensions [{:name "audience" :value-count 2}]})
+        responses     {(str endpoint "/api/dimensions")                {:status 200 :body catalog-body}
+                       (str endpoint "/api/dimensions/audience/values") {:status 200 :body audience-body}}]
+    (with-redefs [http/get (fake-get responses)]
+      (let [result        (ts/fetch-dimensions! cl dim-descriptions
+                                                {:audience {"kids" "Appropriate for young children"}})
+            audience-desc  (get-in result [:audience :description])]
+        (is (clojure.string/includes? audience-desc "kids: Appropriate for young children")
+            "non-channel dimensions get the same per-value prompt treatment as channel")
+        (is (clojure.string/includes? audience-desc "teen: ")
+            "values with no description are still listed, with a blank trailing description")))))
+
+(deftest fetch-dimensions-falls-back-when-value-descriptions-map-empty
   (let [channel-body (json/generate-string
                         {:values [{:value "goldenreels" :usage-count 50}]})
         catalog-body (json/generate-string
                        {:dimensions [{:name "channel" :value-count 1}]})
-        responses    {(str endpoint "/api/dimensions")                     {:status 200 :body catalog-body}
-                      (str endpoint "/api/dimensions/channel/values")       {:status 200 :body channel-body}}]
+        responses    {(str endpoint "/api/dimensions")               {:status 200 :body catalog-body}
+                      (str endpoint "/api/dimensions/channel/values") {:status 200 :body channel-body}}]
     (with-redefs [http/get (fake-get responses)]
       ;; Note: no /descriptions URL in the responses map → 404 from get-json
-      ;; → fetch-channel-descriptions! returns {} → channel description falls
+      ;; → fetch-value-descriptions! returns {} → channel description falls
       ;; back to the static :channel entry in dim-descriptions.
       (let [result (ts/fetch-dimensions! cl dim-descriptions {})]
         (is (= "Tunarr Scheduler channels" (get-in result [:channel :description]))
-            "empty channel-descriptions map → static :channel description unchanged")))))
+            "empty value-descriptions map → static :channel description unchanged")))))
 
-(deftest fetch-dimensions-non-channel-dim-is-unaffected-by-channel-descriptions
+(deftest fetch-dimensions-dimension-is-unaffected-by-other-dimensions-value-descriptions
   (let [audience-body (json/generate-string
                         {:values [{:value "kids" :usage-count 10}]})
         catalog-body  (json/generate-string
@@ -215,9 +235,9 @@
                        (str endpoint "/api/dimensions/audience/values") {:status 200 :body audience-body}}]
     (with-redefs [http/get (fake-get responses)]
       (let [result (ts/fetch-dimensions! cl dim-descriptions
-                                          {"toontown" "Animated content"})]
+                                          {:channel {"toontown" "Animated content"}})]
         (is (= "Audience segments" (get-in result [:audience :description]))
-            "non-channel dimensions don't get the per-channel prompt appended")))))
+            "a dimension's value-descriptions only affect that dimension's own entry")))))
 
 ;; --- retry -----------------------------------------------------------------
 

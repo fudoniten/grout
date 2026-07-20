@@ -8,12 +8,13 @@
   `dimension-name -> {:description ..., :values [...]}` — exactly the
   shape Tunabrain's `/categorize` `categories` parameter expects.
 
-  For the `channel` dimension specifically, Grout also fetches
-  `GET /api/dimensions/channel/descriptions` to get a per-channel
-  description. Without those descriptions the LLM has to guess what
-  an opaque slug like `toontown` means and routinely invents a
-  hallucinated channel (`educational`, `thriller`, etc.) that the
-  controlled-vocabulary guard drops, leaving rows with `channel: nil`.
+  Grout also fetches `GET /api/dimensions/descriptions` to get
+  per-value descriptions for every dimension (channel, audience,
+  freshness, season, time-slot, ...), not just channel. Without those
+  descriptions the LLM has to guess what an opaque slug like
+  `toontown` or `kids` means and routinely invents a hallucinated
+  value (`educational`, `thriller`, etc.) that the controlled-vocabulary
+  guard drops, leaving rows with a `nil` value for that dimension.
 
   Why this is a single source of truth: the dimension catalog lives in
   Tunarr Scheduler's `config.edn` (see `tunarr-scheduler/AGENTS.md`
@@ -76,7 +77,8 @@
 ;; ---------------------------------------------------------------------------
 ;;
 ;; Live API (verified 2026-07-07 against tunarr-scheduler.arr.svc.cluster.local:5545,
-;; updated 2026-07-20 to include /descriptions):
+;; updated 2026-07-20 to include /dimensions/descriptions, covering every
+;; dimension rather than only channel):
 ;;
 ;;   GET /api/dimensions
 ;;     -> {:dimensions [{:name "audience" :value-count 4}
@@ -88,16 +90,17 @@
 ;;                  {:value "teen" :usage-count 260}
 ;;                  ...]}
 ;;
-;;   GET /api/dimensions/channel/descriptions
-;;     -> {:values [{:value "toontown" :description "Animated content..."}
-;;                  ...]}
+;;   GET /api/dimensions/descriptions
+;;     -> {:dimensions {"channel"  {:description "" :values [{:value "toontown" :description "Animated content..."} ...]}
+;;                      "audience" {:description "Who this is for" :values [{:value "kids" :description "..."} ...]}
+;;                      ...}}
 ;;
-;; Note: Tunarr Scheduler does NOT expose a `description` field per
-;; non-channel dimension; we have to bring our own. The orchestrator
-;; merges the dynamic value lists from Tunarr Scheduler with the static
-;; `dimension-descriptions` table in the Grout config (which provides
-;; the natural-language description for each dimension, fed to
-;; Tunabrain's `CategoryDefinition`).
+;; Note: Tunarr Scheduler's per-value descriptions are not guaranteed to be
+;; populated for every value or dimension (a config-driven feature, filled
+;; in incrementally); the whole-dimension natural-language description we
+;; bring ourselves in the static `dimension-descriptions` table in the
+;; Grout config is always the fallback, fed to Tunabrain's
+;; `CategoryDefinition`.
 ;; ---------------------------------------------------------------------------
 
 (defn- description-for
@@ -122,18 +125,19 @@
          sort
          vec)))
 
-(defn- format-channel-description
-  "Render the `channel` dimension's `CategoryDefinition.description` field
-  as a Tunabrain-friendly prompt. The list pairs each channel slug with
-  its Tunarr Scheduler description (e.g. `toontown: Animated content...`),
-  sorted by value so the model sees a stable order across runs.
+(defn- format-value-description
+  "Render a dimension's `CategoryDefinition.description` per-value prompt
+  block. Each line pairs a value with its Tunarr Scheduler description
+  (e.g. `toontown: Animated content...`), sorted by value so the model
+  sees a stable order across runs.
 
-  Channels without a description get an empty trailing colon (`toontown:`)
-  rather than being omitted — the controlled vocabulary stays the same
-  set of values whether or not descriptions are populated, and a missing
-  description is a content problem, not a structural one."
-  [values-by-name channel-values]
-  (->> channel-values
+  Values without a description get an empty trailing colon
+  (`toontown:`) rather than being omitted — the controlled vocabulary
+  stays the same set of values whether or not descriptions are
+  populated, and a missing description is a content problem, not a
+  structural one."
+  [values-by-name dim-values]
+  (->> dim-values
        (map (fn [v]
               (let [desc (or (get values-by-name v) "")]
                 (str "  - " v ": " desc))))
@@ -143,71 +147,75 @@
   "Build a single `CategoryDefinition` map for Tunabrain's `/categorize`
   call: `{:description ... :values [...]}`. The `dim-descriptions` table
   is a static config map (`{:audience \"...\" :channel \"...\"}`)
-  that gives each non-channel dimension a natural-language description.
+  that gives each dimension a natural-language whole-dimension
+  description.
 
-  For the `channel` dimension specifically, `channel-descriptions`
-  (a `{value description}` map from `GET /api/dimensions/channel/descriptions`)
-  takes precedence: the description becomes a per-channel prompt so the
-  LLM can map content like `Computerphile → infobytes` instead of
-  guessing an English description-word. When `channel-descriptions` is
-  nil/empty (e.g. older Tunarr Scheduler without the new endpoint), the
-  static `:channel` entry from `dim-descriptions` is used unchanged —
-  same behaviour as before this PR. Only channels that have a non-blank
-  description in the map contribute to the per-channel prompt block;
-  channels with `nil`/missing/empty descriptions are still listed (so
-  the controlled vocabulary stays the same set of values), but with a
-  blank trailing colon to make the missing-content obvious."
-  [^TunarrSchedulerClient client dim-name dim-descriptions channel-descriptions]
+  `value-descriptions` is the `{dim-keyword {value description}}` map
+  from `fetch-value-descriptions!`. When this dimension has any
+  non-blank per-value description, it takes precedence: the description
+  becomes a per-value prompt so the LLM can map opaque slugs (e.g.
+  `toontown`, `kids`) to what they actually mean instead of guessing
+  from the name alone. When this dimension has no populated
+  descriptions (e.g. older Tunarr Scheduler without the new endpoint,
+  or a dimension nobody has annotated yet), the static description from
+  `dim-descriptions` is used unchanged — same behaviour as before
+  per-value descriptions existed. Only values with a non-blank
+  description in the map contribute a real description to the prompt
+  block; values with `nil`/missing/empty descriptions are still listed
+  (so the controlled vocabulary stays the same set of values), but with
+  a blank trailing colon to make the missing content obvious."
+  [^TunarrSchedulerClient client dim-name dim-descriptions value-descriptions]
   (let [values      (fetch-dimension-values client dim-name)
         base-desc   (description-for dim-name dim-descriptions)
-        description (if (= "channel" (name dim-name))
-                      (let [descs    (or channel-descriptions {})
-                            ;; If no channel descriptions are populated
-                            ;; (older Tunarr Scheduler), the static
-                            ;; :channel description is the right answer —
-                            ;; appending "Available channels and what
-                            ;; fits each:\n  - britannia: \n  - ..." would
-                            ;; be misleading.
-                            populated (some #(not (str/blank? (val %))) descs)]
-                        (if populated
-                          (str base-desc
-                               "\n\nAvailable channels and what fits each:\n"
-                               (format-channel-description descs values))
-                          base-desc))
+        descs       (get value-descriptions (keyword (name dim-name)) {})
+        ;; If no per-value descriptions are populated for this
+        ;; dimension, the static description is the right answer —
+        ;; appending "Available values and what fits each:\n  - kids:
+        ;; \n  - ..." would be misleading.
+        populated   (some #(not (str/blank? (val %))) descs)
+        description (if populated
+                      (str base-desc
+                           "\n\nAvailable values and what fits each:\n"
+                           (format-value-description descs values))
                       base-desc)]
     {:description description
      :values      (vec values)}))
 
-(defn fetch-channel-descriptions!
-  "Fetch the per-channel descriptions from Tunarr Scheduler.
+(defn fetch-value-descriptions!
+  "Fetch per-value descriptions for every dimension from Tunarr Scheduler.
 
-  Calls `GET /api/dimensions/channel/descriptions` and returns a
-  `{value-string description-string}` map, suitable for passing to
-  `fetch-dimensions!`. Empty descriptions are kept (mapped to `\"\"`)
-  rather than dropped — see `format-channel-description`.
+  Calls `GET /api/dimensions/descriptions` and returns a
+  `{dim-keyword {value-string description-string}}` map, suitable for
+  passing to `fetch-dimensions!`. Empty descriptions are kept (mapped
+  to `\"\"`) rather than dropped — see `format-value-description`.
 
   Returns an empty map on a 404 (older Tunarr Scheduler without the
-  endpoint) so callers can keep working with the static `:channel`
-  description. Other HTTP errors propagate as `ExceptionInfo` like the
-  other `get-json` callers — connection errors and unknown hosts
-  propagate out of `get-json`, so we don't need to handle them here."
+  endpoint) so callers can keep working with only the static
+  `dim-descriptions` table. Other HTTP errors propagate as
+  `ExceptionInfo` like the other `get-json` callers — connection errors
+  and unknown hosts propagate out of `get-json`, so we don't need to
+  handle them here."
   [^TunarrSchedulerClient client]
   (try
-    (let [{:keys [values]} (get-json client "/api/dimensions/channel/descriptions")]
-      (if (and (sequential? values) (seq values))
+    (let [{:keys [dimensions]} (get-json client "/api/dimensions/descriptions")]
+      (if (map? dimensions)
         (into {}
-              (keep (fn [{:keys [value description]}]
-                      (when value
-                        [(name value) (or description "")])))
-              values)
-        (do (log/warn "tunarr-scheduler /descriptions returned unexpected shape;"
-                      " falling back to static :channel description"
-                      {:response-count (count (or values []))})
+              (map (fn [[dim-name {:keys [values]}]]
+                     [(keyword (name dim-name))
+                      (into {}
+                            (keep (fn [{:keys [value description]}]
+                                    (when value
+                                      [(name value) (or description "")])))
+                            (or values []))]))
+              dimensions)
+        (do (log/warn "tunarr-scheduler /api/dimensions/descriptions returned unexpected shape;"
+                      " falling back to static dimension descriptions"
+                      {:response-type (type dimensions)})
             {})))
     (catch clojure.lang.ExceptionInfo e
       (if (= 404 (:status (ex-data e)))
-        (do (log/warn "tunarr-scheduler returned 404 for /api/dimensions/channel/descriptions;"
-                      " falling back to static :channel description")
+        (do (log/warn "tunarr-scheduler returned 404 for /api/dimensions/descriptions;"
+                      " falling back to static dimension descriptions")
             {})
         (throw e)))))
 
@@ -221,37 +229,38 @@
   expects.
 
   Arguments:
-    client              — a `TunarrSchedulerClient`
-    dim-descriptions    — static config map `{:audience \"...\" :channel \"...\"}`
-                          providing natural-language descriptions for
-                          each non-channel dimension. Tunarr Scheduler
-                          does not expose descriptions for these; we
-                          ship them in the Grout config.
-    channel-descriptions — optional `{value description}` map from
-                          `fetch-channel-descriptions!`. When present,
-                          the `channel` dimension's `:description` is
-                          rendered as a per-channel prompt. When nil
-                          or empty, the static `:channel` description
-                          from `dim-descriptions` is used as-is (the
-                          pre-PR behaviour).
+    client             — a `TunarrSchedulerClient`
+    dim-descriptions   — static config map `{:audience \"...\" :channel \"...\"}`
+                         providing natural-language whole-dimension
+                         descriptions. Tunarr Scheduler may not have
+                         per-value descriptions for every dimension; we
+                         ship these as a fallback in the Grout config.
+    value-descriptions — optional `{dim-keyword {value description}}`
+                         map from `fetch-value-descriptions!`. When a
+                         dimension has entries here, its `:description`
+                         is rendered as a per-value prompt. When nil,
+                         empty, or the dimension has no entries, the
+                         static description from `dim-descriptions` is
+                         used as-is (the pre-per-value-descriptions
+                         behaviour).
 
   Throws if the catalog fetch fails (callers should retry with
   backoff). Individual dimension fetch failures are logged and
   skipped (the dimension just won't appear in the returned map)."
   ([client dim-descriptions] (fetch-dimensions! client dim-descriptions nil))
-  ([^TunarrSchedulerClient client dim-descriptions channel-descriptions]
+  ([^TunarrSchedulerClient client dim-descriptions value-descriptions]
    (let [catalog (get-json client "/api/dimensions")
          dims    (or (:dimensions catalog) [])]
      (when-not (sequential? dims)
        (throw (ex-info "tunarr-scheduler /api/dimensions returned unexpected shape"
                        {:response catalog})))
      (log/info "Fetched dimension catalog" {:count (count dims)
-                                            :channel-descriptions (count (or channel-descriptions {}))})
+                                            :dimensions-with-value-descriptions (count (or value-descriptions {}))})
      (into {}
            (keep (fn [{dim-name :name}]
                    (when dim-name
                      (try
-                       [(keyword (name dim-name)) (build-dimension client dim-name dim-descriptions channel-descriptions)]
+                       [(keyword (name dim-name)) (build-dimension client dim-name dim-descriptions value-descriptions)]
                        (catch Exception e
                          (log/warn e "Failed to build dimension; skipping"
                                    {:dim dim-name})
@@ -284,12 +293,12 @@
   attempts fail (Grout's enrichment degrades silently without a
   catalog, which we want to make loud).
 
-  `channel-descriptions` is forwarded to `fetch-dimensions!` on every
-  retry so the per-channel prompt is consistent across attempts —
-  the retry is for connection failures, not for transient channel
-  data, so the cached descriptions don't need re-fetching either."
+  `value-descriptions` is forwarded to `fetch-dimensions!` on every
+  retry so the per-value prompts are consistent across attempts — the
+  retry is for connection failures, not for transient value data, so
+  the cached descriptions don't need re-fetching either."
   ([client dim-descriptions] (fetch-dimensions-with-retry! client dim-descriptions nil))
-  ([client dim-descriptions channel-descriptions]
-   (fetch-dimensions-with-retry! client dim-descriptions channel-descriptions 5))
-  ([client dim-descriptions channel-descriptions max-attempts]
-   (retry #(fetch-dimensions! client dim-descriptions channel-descriptions) max-attempts)))
+  ([client dim-descriptions value-descriptions]
+   (fetch-dimensions-with-retry! client dim-descriptions value-descriptions 5))
+  ([client dim-descriptions value-descriptions max-attempts]
+   (retry #(fetch-dimensions! client dim-descriptions value-descriptions) max-attempts)))
