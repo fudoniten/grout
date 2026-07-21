@@ -294,3 +294,61 @@
     (let [resp (patch {:locked false})]
       (is (= 200 (:status resp)))
       (is (false? (get-in resp [:body :locked]))))))
+
+;; ---------------------------------------------------------------------------
+;; patch-handler: :dimensions validated against dim-config (a fat-fingered
+;; channel slug on a manual edit is exactly the kind of typo the vocabulary
+;; guard exists for -- unlike the LLM path, which drops an invalid value and
+;; proceeds, a manual edit rejects the whole request so the operator notices).
+;; ---------------------------------------------------------------------------
+
+(def ^:private deps-with-dim-config
+  (assoc deps :dim-config {:channel {:description "c" :values ["toontown" "infobytes" "galaxy"]}}))
+
+(defn- patch-with-dim-config [body]
+  ((dirprof/patch-handler deps-with-dim-config)
+   {:parameters {:path {:tag "parent-directory:x"} :body body}}))
+
+(deftest patch-dimensions-rejects-unknown-value
+  (with-redefs [dp/get-profile-for-tag (fn [_ _] {:status "ready" :tag_value "parent-directory:x"
+                                                  :dimensions {} :tags []})]
+    (let [resp (patch-with-dim-config {:dimensions {:channel ["tootnown"]}})]
+      (is (= 400 (:status resp)))
+      (is (re-find #"tootnown" (get-in resp [:body :error])))
+      (is (= [{:dimension :channel :value "tootnown"}] (get-in resp [:body :rejected]))))))
+
+(deftest patch-dimensions-rejects-without-calling-set-manual-or-fanout
+  ;; A rejected patch must not touch the profile or fan out at all -- no
+  ;; partial save, since the operator needs to see and fix the typo first.
+  (let [manual-called? (atom false) fanout-called? (atom false)]
+    (with-redefs [dp/get-profile-for-tag (fn [_ _] {:status "ready" :tag_value "parent-directory:x"
+                                                    :dimensions {} :tags []})
+                  dp/set-manual!         (fn [& _] (reset! manual-called? true))
+                  store/force-set-channels-by-tag! (fn [& _] (reset! fanout-called? true))]
+      (patch-with-dim-config {:dimensions {:channel ["tootnown"]}})
+      (is (false? @manual-called?))
+      (is (false? @fanout-called?)))))
+
+(deftest patch-dimensions-accepts-known-values
+  (with-redefs [dp/get-profile-for-tag (fn [_ _] {:status "ready" :tag_value "parent-directory:x"
+                                                  :dimensions {} :tags []})
+                dp/set-manual!         (fn [_ tag _] {:status "ready" :tag_value tag :locked true
+                                                       :dimensions {:channel ["toontown"]} :tags []})
+                store/force-set-channels-by-tag! (fn [& _] 1)
+                store/count-by-tag     (fn [_ _] 1)]
+    (let [resp (patch-with-dim-config {:dimensions {:channel ["toontown" "infobytes"]}})]
+      (is (= 200 (:status resp))))))
+
+(deftest patch-dimensions-with-no-configured-vocabulary-passes-through
+  ;; Same graceful-degradation rule as the LLM path: a dimension with no
+  ;; configured vocabulary at all (e.g. Tunarr Scheduler unreachable at
+  ;; startup, or a dimension TS doesn't define) can't be judged, so it's
+  ;; allowed through unvalidated rather than rejecting every manual edit.
+  (with-redefs [dp/get-profile-for-tag (fn [_ _] {:status "ready" :tag_value "parent-directory:x"
+                                                  :dimensions {} :tags []})
+                dp/set-manual!         (fn [_ tag _] {:status "ready" :tag_value tag :locked true
+                                                       :dimensions {:audience ["anything-goes"]} :tags []})
+                store/force-set-channels-by-tag! (fn [& _] 1)
+                store/count-by-tag     (fn [_ _] 1)]
+    (let [resp (patch-with-dim-config {:dimensions {:audience ["anything-goes"]}})]
+      (is (= 200 (:status resp))))))
