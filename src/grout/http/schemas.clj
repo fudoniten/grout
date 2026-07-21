@@ -150,7 +150,7 @@
 
 (def DirectoryProfilePatch
   [:map {:title "DirectoryProfilePatch"
-         :description "Manual overrides for PATCH /grout/directory-profiles/:tag. At least one field is required. Provided fields fully replace the corresponding profile field; omitted fields are left unchanged. Setting :dimensions and/or :tags implicitly locks the profile (see :locked) unless :locked is also given explicitly in the same request."}
+         :description "Manual overrides for PATCH /grout/directory-profiles/:tag. At least one field is required. Provided fields fully replace the corresponding profile field; omitted fields are left unchanged. Setting :dimensions and/or :tags implicitly locks the profile (see :locked) unless :locked is also given explicitly in the same request. :dimensions values are validated against the Tunarr Scheduler vocabulary; a request containing any value outside it is rejected with 400 rather than silently dropped."}
    [:dimensions {:optional true} [:map-of :string [:vector :string]]]
    [:tags {:optional true} [:vector :string]]
    [:context {:optional true} [:maybe DirectoryProfileManualContext]]

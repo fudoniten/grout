@@ -16,7 +16,8 @@
 
    The endpoint is tag-agnostic: `:tag` is any tag value (in v1 always a
    `parent-directory:<x>` tag written by `grout-cli --upload-dir`)."
-  (:require [grout.directory-profiles :as dp]
+  (:require [grout.dimensions :as dim]
+            [grout.directory-profiles :as dp]
             [grout.enrichment.directory-worker :as dworker]
             [grout.media.store :as store]
             [clojure.string :as str]
@@ -124,24 +125,57 @@
                  (seq (:links context))))
     context))
 
+(defn- invalid-dimensions-error
+  "400 body describing which submitted dimension values aren't in the Tunarr
+   Scheduler vocabulary, per `grout.dimensions/filter-dimension-map`'s
+   `:rejected` list. `:rejected` is included structured (not just in the
+   message) so a UI can highlight the specific offending value(s)."
+  [rejected]
+  {:error (str "Unknown dimension value(s), not in the Tunarr Scheduler "
+              "vocabulary: "
+              (str/join ", " (map (fn [{:keys [dimension value]}]
+                                    (str (name dimension) ":" value))
+                                  rejected)))
+   :rejected rejected})
+
 (defn patch-handler
   "PATCH /grout/directory-profiles/:tag. Body: any of `:dimensions`, `:tags`,
    `:context`, `:locked` (see DirectoryProfilePatch; at least one required).
 
-   Applies the operator's manual edit via `dp/set-manual!` and, when
-   `:dimensions` and/or `:tags` were provided, immediately fans the new
+   `:dimensions` (when present) is validated against the same Tunarr
+   Scheduler-derived vocabulary the LLM path is checked against (see
+   `grout.dimensions/filter-dimension-map`) — a manual edit is exactly where a
+   fat-fingered channel/audience slug (`tootnown` for `toontown`) would
+   otherwise silently create a value nothing schedules against, with no
+   error to notice it by. Unlike the LLM path (which drops invalid values and
+   proceeds), a manual edit REJECTS the whole request (400) on any invalid
+   value — the operator should see and fix the typo, not have it silently
+   dropped from what they thought they saved. A dimension with no configured
+   vocabulary (e.g. Tunarr Scheduler was unreachable at startup) passes
+   through unvalidated, same as the LLM path.
+
+   Otherwise, applies the operator's manual edit via `dp/set-manual!` and,
+   when `:dimensions` and/or `:tags` were provided, immediately fans the new
    values out to every child media row via
    `store/force-set-channels-by-tag!` — an UNCONDITIONAL overwrite (unlike
    the LLM-driven fan-out's COALESCE/never-clobber semantics), because the
    whole point of a manual edit is correcting an already-wrong assignment,
    not just filling blanks. This takes effect immediately rather than
    waiting for the next growth-triggered sweep."
-  [{:keys [ds]}]
+  [{:keys [ds dim-config]}]
   (fn [{{{:keys [tag]} :path body :body} :parameters}]
     (let [patch (cond-> (select-keys body [:dimensions :tags :context :locked])
-                  (contains? body :context) (update :context context-patch->stored))]
-      (if (empty? patch)
+                  (contains? body :context) (update :context context-patch->stored))
+          rejected (when (contains? patch :dimensions)
+                     (:rejected (dim/filter-dimension-map dim-config (:dimensions patch))))]
+      (cond
+        (empty? patch)
         {:status 400 :body {:error "No mutable fields provided"}}
+
+        (seq rejected)
+        {:status 400 :body (invalid-dimensions-error rejected)}
+
+        :else
         (if-let [old-profile (dp/get-profile-for-tag ds tag)]
           (let [updated (dp/set-manual! ds tag patch)]
             (when (or (contains? patch :dimensions) (contains? patch :tags))
