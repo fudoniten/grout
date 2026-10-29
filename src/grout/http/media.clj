@@ -46,6 +46,7 @@
    :source-url (:source_url row)
    :enriched (:enriched row)
    :content-hash (:content_hash row)
+   :fingerprint (:fingerprint row)
    :stream-url (stream-url (:id row))
    :created-at (some-> (:created_at row) str)
    :superseded-at (some-> (:superseded_at row) str)})
@@ -107,6 +108,36 @@
 (defn get-by-hash-handler [{:keys [ds]}]
   (fn [{{{:keys [hash]} :path} :parameters}]
     (if-let [row (store/find-by-hash ds hash)]
+      {:status 200 :body (row->full row)}
+      not-found)))
+
+(defn- pick-match
+  "Of the rows sharing one fingerprint, prefer a live one, newest first."
+  [rows]
+  (let [newest #(last (sort-by :created_at %))]
+    (or (newest (remove :superseded_at rows))
+        (newest rows))))
+
+(defn by-fingerprints-handler
+  "POST /grout/by-fingerprint: batch existence check. Returns `matches`, one
+   full item (carrying its `fingerprint`) per fingerprint already stored;
+   absent fingerprints are simply missing. A list rather than a map keyed by
+   fingerprint because the JSON encoder kebab-cases every map key. Like
+   by-hash, superseded rows are included (callers re-upload to revive them)."
+  [{:keys [ds]}]
+  (fn [{{{:keys [fingerprints]} :body} :parameters}]
+    (let [rows (store/find-by-fingerprints ds fingerprints)]
+      {:status 200
+       :body {:matches (mapv (comp row->full pick-match)
+                             (vals (group-by :fingerprint rows)))}})))
+
+(defn attach-fingerprint-handler
+  "PUT /grout/media/:id/fingerprint: record a client-computed fingerprint on
+   an item ingested before fingerprints existed. A row that already has one
+   keeps it."
+  [{:keys [ds]}]
+  (fn [{{{:keys [id]} :path {:keys [fingerprint]} :body} :parameters}]
+    (if-let [row (store/attach-fingerprint! ds id fingerprint)]
       {:status 200 :body (row->full row)}
       not-found)))
 

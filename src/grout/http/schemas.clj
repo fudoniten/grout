@@ -52,6 +52,7 @@
    [:source-url {:optional true} [:maybe {:description "Origin URL for orphan content."} :string]]
    [:enriched [:boolean {:description "Whether the AI metadata pass has completed."}]]
    [:content-hash {:optional true} [:maybe {:description "SHA-256 of the original source bytes (dedup key)."} :string]]
+   [:fingerprint {:optional true} [:maybe {:description "Sampled fingerprint of the original source bytes (fast existence check; see POST /grout/by-fingerprint). Null on items ingested before fingerprints existed."} :string]]
    [:stream-url [:string {:description "HTTP byte-range streaming fallback path."}]]
    [:created-at {:optional true} [:maybe {:description "Creation timestamp (ISO-8601)."} :string]]
    [:superseded-at {:optional true} [:maybe {:description "Soft-delete timestamp, or null if live."} :string]]])
@@ -168,6 +169,23 @@
 
 (def IdPath
   [:map [:id [:uuid {:description "Media item id."}]]])
+
+(def Fingerprint
+  [:re {:description "A fingerprint as computed by grout-cli / grout.media.hash/fingerprint-file (`fp1:` + 64 hex)."}
+   #"^fp1:[0-9a-f]{64}$"])
+
+(def FingerprintLookup
+  [:map {:title "FingerprintLookup"}
+   [:fingerprints [:vector {:max 1000 :description "Up to 1000 fingerprints to check."} Fingerprint]]])
+
+(def FingerprintMatches
+  [:map {:title "FingerprintMatches"}
+   [:matches [:vector {:description "One stored item per fingerprint already stored; match on each item's `fingerprint`."}
+              Media]]])
+
+(def FingerprintAttach
+  [:map {:title "FingerprintAttach"}
+   [:fingerprint Fingerprint]])
 
 (def HashPath
   [:map [:hash [:string {:description "SHA-256 hex of the source bytes."}]]])

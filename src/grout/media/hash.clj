@@ -32,6 +32,45 @@
     (io/copy (DigestInputStream. in md) (io/file out))
     (hex (.digest md))))
 
+(def fingerprint-chunk-bytes
+  "Size of each sampled region in `fingerprint-file`."
+  (* 64 1024))
+
+(defn- fingerprint-regions
+  "[offset length] pairs a fingerprint samples for a file of `size` bytes: the
+   start, middle and end chunks, or the whole file when it is too small to
+   hold three distinct chunks."
+  [size]
+  (let [c fingerprint-chunk-bytes]
+    (if (<= size (* 3 c))
+      [[0 size]]
+      [[0 c] [(- (quot size 2) (quot c 2)) c] [(- size c) c]])))
+
+(defn fingerprint-file
+  "A cheap content fingerprint for `path`: \"fp1:\" + hex SHA-256 over the
+   file size and three 64 KiB samples (start, middle, end). It reads at most
+   192 KiB whatever the file size, so a client can ask \"is this stored?\"
+   without a full hash. Re-encodes, remuxes and truncated downloads all change
+   the size or a sampled region; two different media files matching on all of
+   them is vanishingly rare, but possible, so `content-hash` (the full SHA-256)
+   stays the authoritative dedup key server-side.
+
+   Must stay byte-for-byte in sync with `fingerprint-file` in
+   bin/grout-cli.bb; both are checked against the same test vector. Bump the
+   `fp1:` prefix if the algorithm ever changes."
+  [path]
+  (let [f    (io/file path)
+        size (.length f)
+        md   (MessageDigest/getInstance "SHA-256")]
+    (.update md (.getBytes (str size "\n") "UTF-8"))
+    (with-open [raf (java.io.RandomAccessFile. f "r")]
+      (doseq [[off len] (fingerprint-regions size)]
+        (let [buf (byte-array len)]
+          (.seek raf off)
+          (.readFully raf buf)
+          (.update md buf))))
+    (str "fp1:" (hex (.digest md)))))
+
 (defn content-path
   "Content-addressed storage path for `hash` under `base-dir`:
    <base-dir>/<ab>/<hash>.mp4 (sharded by the first two hex chars)."

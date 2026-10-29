@@ -87,6 +87,24 @@
                        404 {:body s/APIError}}
            :handler (media/get-by-hash-handler media)}}]
 
+   ["/grout/by-fingerprint"
+    {:post {:tags ["media"]
+            :summary "Batch existence check by sampled fingerprint"
+            :description "Body `{fingerprints: [...]}` (up to 1000). Returns `matches`: one item (with its `fingerprint`) for each one already stored, superseded items included. Far cheaper for clients than a full SHA-256 per file; items ingested before fingerprints existed only match once a fingerprint is attached (PUT /grout/media/:id/fingerprint)."
+            :parameters {:body s/FingerprintLookup}
+            :responses {200 {:body s/FingerprintMatches}}
+            :handler (media/by-fingerprints-handler media)}}]
+
+   ["/grout/media/:id/fingerprint"
+    {:put {:tags ["media"]
+           :summary "Attach a fingerprint to an item that has none"
+           :description "For items ingested before fingerprints existed: a client that confirmed a match by full hash records the file's fingerprint so later checks are fast. Never overwrites an existing fingerprint."
+           :parameters {:path s/IdPath
+                        :body s/FingerprintAttach}
+           :responses {200 {:body s/Media}
+                       404 {:body s/APIError}}
+           :handler (media/attach-fingerprint-handler media)}}]
+
    ["/grout/media/:id"
     {:get {:tags ["media"]
            :summary "Fetch one media item"

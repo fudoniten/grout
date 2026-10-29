@@ -209,6 +209,52 @@
       (is (some? @captured-path))
       (is (not (.exists (io/file @captured-path))) "temp upload file removed after intake"))))
 
+;; --- by-fingerprint -------------------------------------------------------
+
+(def ^:private fp-a (str "fp1:" (apply str (repeat 64 "a"))))
+(def ^:private fp-b (str "fp1:" (apply str (repeat 64 "b"))))
+
+(deftest by-fingerprint-returns-only-matches
+  (let [asked (atom nil)]
+    (with-redefs [store/find-by-fingerprints (fn [_ fps] (reset! asked fps)
+                                               [(assoc sample-row :fingerprint fp-a)])]
+      (let [resp (call (handler) (json-req :post "/grout/by-fingerprint"
+                                           {:fingerprints [fp-a fp-b]}))]
+        (is (= 200 (:status resp)))
+        (is (= [fp-a fp-b] @asked))
+        (is (= 1 (count (get-in resp [:body :matches]))))
+        (is (= fp-a (get-in resp [:body :matches 0 :fingerprint]))
+            "fingerprint survives the kebab-case JSON encoder (it's a value, not a key)")
+        (is (= (str sample-id) (get-in resp [:body :matches 0 :id])))))))
+
+(deftest by-fingerprint-prefers-live-row
+  (let [old-id (java.util.UUID/randomUUID)]
+    (with-redefs [store/find-by-fingerprints
+                  (fn [_ _] [(assoc sample-row :id old-id :fingerprint fp-a
+                                    :superseded_at (java.time.Instant/now))
+                             (assoc sample-row :fingerprint fp-a)])]
+      (let [resp (call (handler) (json-req :post "/grout/by-fingerprint"
+                                           {:fingerprints [fp-a]}))]
+        (is (= [(str sample-id)] (mapv :id (get-in resp [:body :matches]))))))))
+
+(deftest by-fingerprint-rejects-malformed
+  (let [resp (call (handler) (json-req :post "/grout/by-fingerprint"
+                                       {:fingerprints ["deadbeef"]}))]
+    (is (= 400 (:status resp)))))
+
+(deftest attach-fingerprint
+  (let [captured (atom nil)]
+    (with-redefs [store/attach-fingerprint! (fn [_ id fp] (reset! captured [id fp])
+                                              (assoc sample-row :fingerprint fp))]
+      (let [resp (call (handler) (json-req :put (str "/grout/media/" sample-id "/fingerprint")
+                                           {:fingerprint fp-a}))]
+        (is (= 200 (:status resp)))
+        (is (= [sample-id fp-a] @captured))
+        (is (= fp-a (get-in resp [:body :fingerprint]))))))
+  (with-redefs [store/attach-fingerprint! (fn [_ _ _] nil)]
+    (is (= 404 (:status (call (handler) (json-req :put (str "/grout/media/" sample-id "/fingerprint")
+                                                  {:fingerprint fp-a})))))))
+
 ;; --- by-hash ---------------------------------------------------------------
 
 (deftest by-hash-found
