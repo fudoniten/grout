@@ -154,9 +154,16 @@
 (defn- run-ffmpeg!
   "Run `args` with a timeout. Returns {:exit n :err stderr}, with exit -1 when
    the process was killed for running too long. stderr goes to a temp file
-   rather than a pipe so a chatty encode can't fill the pipe and stall."
-  [args timeout-secs]
-  (let [err-f (java.io.File/createTempFile "grout-ffmpeg-" ".log")]
+   rather than a pipe so a chatty encode can't fill the pipe and stall. The
+   temp file is created in `work-dir` when given: java.io.tmpdir defaults to
+   /tmp, which minimal nix containers don't have (and JDKs before 22 ignore
+   TMPDIR), so the output's parent - always created by the normalize caller
+   before this runs - is the safe home for the stderr log."
+  [args timeout-secs work-dir]
+  (let [err-f (if work-dir
+                (java.io.File/createTempFile "grout-ffmpeg-" ".log"
+                                             (java.io.File. ^String work-dir))
+                (java.io.File/createTempFile "grout-ffmpeg-" ".log"))]
     (try
       (let [proc (-> (ProcessBuilder. ^java.util.List (vec args))
                      (.redirectOutput ProcessBuilder$Redirect/DISCARD)
@@ -176,8 +183,9 @@
    takes a permit from the profile's `:transcode-permits` semaphore (set up in
    grout.system), so only a bounded number of video encodes share the
    GPU/CPU at once; copies and audio-only fixes are cheap and skip the queue.
-   The ffmpeg timeout starts once the permit is held."
-  [args profile plan duration-ms]
+   The ffmpeg timeout starts once the permit is held. `work-dir` is passed to
+   `run-ffmpeg!` as the home for its stderr temp file (see there)."
+  [args profile plan duration-ms work-dir]
   (let [^java.util.concurrent.Semaphore permits (:transcode-permits profile)
         gated? (and permits (= :transcode (:video plan)))]
     (when gated?
@@ -187,7 +195,7 @@
                    :queued (.getQueueLength permits)}))
       (.acquire permits))
     (try
-      (run-ffmpeg! args (ffmpeg-timeout-secs duration-ms))
+      (run-ffmpeg! args (ffmpeg-timeout-secs duration-ms) work-dir)
       (finally
         (when gated? (.release permits))))))
 
@@ -204,9 +212,10 @@
          conforming? (= plan {:video :copy :audio :copy})
          tmp         (str out ".tmp-" (System/currentTimeMillis) ".mp4")
          args        (normalize-args in tmp profile plan)
+         work-dir    (.getParent (io/file out))
          _           (log/info "Normalizing media"
                                {:in in :out out :conforming conforming? :plan plan})
-         {:keys [exit err]} (run-normalize! args profile plan (:duration-ms pr))]
+         {:keys [exit err]} (run-normalize! args profile plan (:duration-ms pr) work-dir)]
      (when-not (zero? exit)
        (io/delete-file tmp true)
        (throw (ex-info "ffmpeg normalize failed"
@@ -230,9 +239,10 @@
          out         (with-ext path ".mp4")
          tmp         (str out ".tmp-" (System/currentTimeMillis) ".mp4")
          args        (normalize-args path tmp profile plan)
+         work-dir    (.getParent (io/file out))
          _           (log/info "Normalizing media"
                                {:path path :conforming conforming? :plan plan :out out})
-         {:keys [exit err]} (run-normalize! args profile plan (:duration-ms pr))]
+         {:keys [exit err]} (run-normalize! args profile plan (:duration-ms pr) work-dir)]
      (when-not (zero? exit)
        (io/delete-file tmp true)
        (throw (ex-info "ffmpeg normalize failed"
