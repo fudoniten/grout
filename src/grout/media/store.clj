@@ -72,7 +72,7 @@
 
 (def ^:private insertable-keys
   [:kind :path :content_hash :name :description :channel :tags :duration_ms
-   :width :height :vcodec :acodec :source :source_url :enriched])
+   :width :height :vcodec :acodec :source :source_url :enriched :fingerprint])
 
 (defn- exec-one [ds sqlmap]
   (jdbc/execute-one! ds (sql/format sqlmap)
@@ -113,6 +113,27 @@
   (exec-one ds {:select [:*]
                 :from   :grout_media
                 :where  [:= :content_hash content-hash]}))
+
+(defn find-by-fingerprints
+  "Rows whose `fingerprint` is in `fingerprints`, including superseded rows
+   (like `find-by-hash`). Several rows can share a fingerprint; callers pick.
+   Returns [] for an empty input."
+  [ds fingerprints]
+  (if (empty? fingerprints)
+    []
+    (exec ds {:select [:*]
+              :from   :grout_media
+              :where  [:in :fingerprint (vec (distinct fingerprints))]})))
+
+(defn attach-fingerprint!
+  "Record `fingerprint` on row `id` when the row has none yet (rows ingested
+   before fingerprints existed). Never overwrites an existing value. Returns
+   the row, or nil when no row has that id."
+  [ds id fingerprint]
+  (exec-one ds {:update :grout_media
+                :set    {:fingerprint [:coalesce :fingerprint fingerprint]}
+                :where  [:= :id id]
+                :returning [:*]}))
 
 (defn update-fields!
   "Set arbitrary columns on a row by id and return it. `:tags` (if present) is

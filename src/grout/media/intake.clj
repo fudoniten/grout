@@ -47,8 +47,9 @@
 (defn- dedup!
   "Merge an intake request into an existing row: union tags, fill blank
    name/description/channel, and revive if superseded."
-  [ds existing {:keys [tags name description channel]}]
-  (let [merged {:tags          (vec (distinct (concat (vec (:tags existing))
+  [ds existing {:keys [tags name description channel fingerprint]}]
+  (let [merged {:fingerprint   (or (:fingerprint existing) fingerprint)
+                :tags          (vec (distinct (concat (vec (:tags existing))
                                                       (vec (or tags [])))))
                 :name          (or (not-empty (:name existing)) name)
                 :description   (or (not-empty (:description existing)) description)
@@ -66,7 +67,10 @@
    {:row created-or-updated-row :deduplicated bool}."
   [{:keys [ds media-dir profile]}
    {:keys [path kind channel tags source source-url name description] :as req}]
-  (let [content-hash (or (:content-hash req) (hash/sha256-file path))]
+  (let [content-hash (or (:content-hash req) (hash/sha256-file path))
+        ;; Always from the bytes we received, never the caller's claim. Cheap
+        ;; (three small reads), and it backfills older rows on a dedup hit.
+        req          (assoc req :fingerprint (hash/fingerprint-file path))]
     (if-let [existing (store/find-by-hash ds content-hash)]
       {:row (dedup! ds existing req) :deduplicated true}
       (try
@@ -82,6 +86,7 @@
                                {:kind (derive-kind kind (:duration-ms pr))
                                 :path final-path
                                 :content_hash content-hash
+                                :fingerprint (:fingerprint req)
                                 :name name
                                 :description description
                                 :channel channel

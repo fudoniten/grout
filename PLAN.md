@@ -54,3 +54,8 @@ in the [ecosystem plan](https://github.com/fudoniten/pseudovision/blob/master/PL
   (never-tried first), so rows Tunabrain can't enrich rotate to the back
   instead of blocking the queue. Failing rows are retried forever, just less
   often; add an attempt cap if that turns out noisy.
+- 2026-10-29: clients check existence by sampled fingerprint (`fp1:`, size +
+  three 64 KiB samples) via `POST /grout/by-fingerprint`, falling back to a
+  full hash only on a miss. Peter accepted the tiny collision risk (~99.5%
+  was the bar). `content_hash` stays the intake dedup key. grout-cli's
+  `--manifest` hash cache was removed for it.

@@ -1,13 +1,20 @@
 #!/usr/bin/env bb
 ;; grout-cli — upload/tag filler media on a Grout server.
 ;;
-;; No filesystem is shared with the server: this CLI hashes the file locally
-;; with the same algorithm the server uses for its content-hash dedup key
-;; (SHA-256 of the raw bytes, matching sha256sum) and looks it up via
-;; GET /grout/by-hash/:hash. If the file is already stored, only the tags are
-;; added (idempotent); otherwise the file's bytes are uploaded as a
-;; multipart/form-data POST to /grout/media, which hashes/probes/normalizes
-;; and stores it server-side.
+;; No filesystem is shared with the server. To decide whether a file is
+;; already stored the CLI first computes a cheap sampled fingerprint (size +
+;; three 64 KiB chunks, the same algorithm as grout.media.hash/fingerprint-file)
+;; and checks every file of a run in one POST /grout/by-fingerprint. Only on a
+;; miss does it read the whole file for a SHA-256 and ask GET /grout/by-hash/:hash,
+;; which catches items stored before fingerprints existed; on such a hit it
+;; attaches the fingerprint so the next run is fast. If the file is already
+;; stored, only the tags are added (idempotent); otherwise the file's bytes are
+;; uploaded as a multipart/form-data POST to /grout/media, which hashes, probes,
+;; normalizes and stores it server-side.
+;;
+;; Re-running over files that are already uploaded therefore costs ~192 KiB of
+;; reads per file plus one request per directory, so no local resume state is
+;; kept.
 
 (require '[babashka.cli :as cli]
          '[babashka.fs :as fs]
@@ -35,7 +42,7 @@ Options:
       --name=STR         Title (only sensible for a single file)
       --description=STR  Description (only sensible for a single file)
       --no-filename-tag  Don't auto-add the default filename:<name> tag
-      --dry-run          Hash and look up each file; don't upload or tag
+      --dry-run          Look up each file; don't upload, tag or attach fingerprints
       --json             Emit one JSON result object per line
   -v, --verbose          Print request details to stderr
   -h, --help             Show this help
@@ -64,12 +71,8 @@ Directory-upload mode (--upload-dir):
                          (Provided for symmetry with --wait and for callers
                          scripting the bulk path.)
       --threshold-pct=N  Re-enrich only if the item count grew >N% (default 20)
-      --manifest=PATH    JSONL cache of (path,size,mtime) -> sha256. Looked up before
-                         hashing a file (cache hit skips sha256-file) and appended
-                         after each successful process. Resumable across runs: a
-                         re-run only re-hashes files whose size or mtime changed.
-                         If PATH is unwritable, the CLI logs a warning and proceeds
-                         without caching (no upload is lost).
+      --manifest=PATH    Deprecated and ignored. Fingerprint lookups made the
+                         local hash cache unnecessary.
 
 By default every file also gets a `filename:<basename>` tag, so the original
 filename is always searchable even after enrichment renames it.
@@ -146,125 +149,34 @@ Examples:
             (recur)))))
     (apply str (map #(format "%02x" (bit-and (int %) 0xff)) (.digest md)))))
 
-;; --- Manifest cache: (path, size, mtime) -> sha256 ------------------------
+;; --- Fingerprint: size + three 64 KiB samples -----------------------------
 ;;
-;; Backed by a JSONL file. The cache key is the triple `(path, size, mtime)`;
-;; any change to size or mtime invalidates the entry and forces a re-hash.
-;; Path is the absolute (canonical) filesystem path — `fs/absolutize` resolves
-;; `.` and `..` and removes the trailing-slash difference.
-;;
-;; The cache is append-only on the success path: a row is written only after
-;; `process-file!` returns a non-error result. A mid-run crash (or a row that
-;; the CLI couldn't even hash) leaves the manifest in its prior valid state,
-;; so a resume picks up the unfinished file cleanly.
-;;
-;; Concurrent CLI invocations writing the same manifest are not safe — the
-;; bulk wrapper (or the user) is expected to serialise. Each line is
-;; self-contained JSON, so a torn write corrupts at most one row.
-;;
-;; `load-manifest!` and `cache-hash!` are best-effort: if the file is missing,
-;; empty, or malformed, the cache starts empty and writes are skipped with a
-;; warning. The CLI never fails an upload because of a manifest problem.
+;; Must stay byte-for-byte in sync with grout.media.hash/fingerprint-file on the
+;; server; test-bb/grout_cli_test.clj and test/grout/media/hash_test.clj assert
+;; the same vectors. Bump the `fp1:` prefix if the algorithm ever changes.
 
-(defn- manifest-key
-  "Build the (path, size, mtime) cache key for `path`. Uses
-   `fs/absolutize` so 'foo/' and 'foo' map to the same row. Missing
-   stat info (e.g. file deleted between walk and process) yields
-   a sentinel of -1 / -1, which will never match a real cache hit and
-   therefore forces a re-hash."
+(def ^:private fingerprint-chunk-bytes (* 64 1024))
+
+(defn fingerprint-file
+  "\"fp1:\" + hex SHA-256 over `path`'s size and its start, middle and end
+   64 KiB (or the whole file when it is 192 KiB or smaller). Reads at most
+   192 KiB whatever the file size."
   [path]
-  (let [abs (str (fs/absolutize path))
-        f   (java.io.File. (str path))
-        sz  (try (.length f) (catch Exception _ -1))
-        mt  (try (long (/ (.lastModified f) 1000)) (catch Exception _ -1))]
-    [abs sz mt]))
-
-(defn- manifest-path-open
-  "Open `path` for append. Returns a java.io.BufferedWriter, or nil if the
-   file can't be opened for write (caller treats that as 'no manifest')."
-  [path]
-  (try
-    (let [f (fs/file path)]
-      (when-let [parent (fs/parent f)]
-        (fs/create-dirs parent))
-      (clojure.java.io/writer f :append true))
-    (catch Exception _ nil)))
-
-(defn- manifest-line
-  "Render a manifest row as a single JSONL line. Returns the string with
-   a trailing newline, or nil if any field is missing/blank."
-  [path size mtime hash]
-  (let [row {:path path :size size :mtime mtime :hash hash}]
-    (when (and path size mtime hash (not (str/blank? path)) (not (str/blank? hash)))
-      (str (json/generate-string row) "\n"))))
-
-(defn load-manifest!
-  "Read the JSONL manifest at `path` (if any) into an atom holding a
-   `{[abs-path size mtime] hash}` map. Lines that fail to parse are skipped
-   with a stderr warning — the cache never throws on bad input.
-
-   Returns the atom. Returns an empty atom if `path` is nil/blank, the file
-   is missing, or every line was malformed."
-  [path]
-  (let [cache (atom {})]
-    (when (and path (not (str/blank? path)) (fs/exists? path))
-      (try
-        (with-open [rdr (clojure.java.io/reader path)]
-          (doseq [line (line-seq rdr)]
-            (let [trimmed (str/trim line)]
-              (when (seq trimmed)
-                (try
-                  (let [row (json/parse-string trimmed true)
-                        k [(str (fs/absolutize (:path row))) (:size row) (:mtime row)]]
-                    (swap! cache assoc k (:hash row)))
-                  (catch Exception e
-                    (binding [*out* *err*]
-                      (println (str "warning: skipping malformed manifest line: "
-                                    (or (ex-message e) (str e)))))))))))
-        (catch Exception e
-          (binding [*out* *err*]
-            (println (str "warning: failed to read manifest " path ": "
-                          (or (ex-message e) (str e))))))))
-    cache))
-
-(defn- file-hash
-  "Look up `path`'s sha256 in `cache`. If found, return the cached hash.
-   If not, compute it with `sha256-file` and remember the result in `cache`
-   for the rest of this run. The manifest row is flushed via `flush-manifest!`
-   only after the surrounding process-file! succeeds, so a failed file isn't
-   cached on disk."
-  [cache path]
-  (let [k (manifest-key path)]
-    (if-let [cached (get @cache k)]
-      cached
-      (let [h (sha256-file path)]
-        (swap! cache assoc k h)
-        h))))
-
-;; --- end manifest cache -----------------------------------------------------
-
-(defn- flush-manifest!
-  "Append the (path, size, mtime, hash) row for `path` (per `cache`) to the
-   JSONL file at `manifest-path`. No-op if `manifest-path` is nil/blank
-   or the file isn't writable. Returns true on success, false otherwise.
-   The in-memory cache is updated either way; only the on-disk row is
-   best-effort."
-  [cache manifest-path path]
-  (when (and manifest-path (not (str/blank? manifest-path)))
-    (let [k (manifest-key path)
-          [abs sz mt] k
-          hash (get @cache k)]
-      (when hash
-        (try
-          (let [line (manifest-line abs sz mt hash)]
-            (when-let [w (manifest-path-open manifest-path)]
-              (try (.write w line) (.flush w) true
-                   (finally (.close w)))))
-          (catch Exception e
-            (binding [*out* *err*]
-              (println (str "warning: failed to write manifest row for "
-                            abs ": " (or (ex-message e) (str e)))))
-            false))))))
+  (let [f    (fs/file path)
+        size (.length f)
+        c    fingerprint-chunk-bytes
+        md   (MessageDigest/getInstance "SHA-256")
+        regions (if (<= size (* 3 c))
+                  [[0 size]]
+                  [[0 c] [(- (quot size 2) (quot c 2)) c] [(- size c) c]])]
+    (.update md (.getBytes (str size "\n") "UTF-8"))
+    (with-open [raf (java.io.RandomAccessFile. f "r")]
+      (doseq [[off len] regions]
+        (let [buf (byte-array len)]
+          (.seek raf (long off))
+          (.readFully raf buf)
+          (.update md buf))))
+    (str "fp1:" (apply str (map #(format "%02x" (bit-and (int %) 0xff)) (.digest md))))))
 
 (defn- split-tags [s]
   (when (some? s)
@@ -361,6 +273,37 @@ Examples:
 (defn- by-hash [server hash verbose?]
   (http-get (str server "/grout/by-hash/" hash) verbose?))
 
+(def ^:private fingerprint-batch-size 500)
+
+(defn lookup-fingerprints
+  "Ask the server which of `fps` are already stored, in batches. Returns a map
+   of fingerprint -> item. A server without /grout/by-fingerprint (or any
+   failed batch) just yields no matches for those fingerprints: each file then
+   falls back to the full-hash lookup, which is slower but always correct."
+  [server fps verbose?]
+  (reduce
+   (fn [acc batch]
+     (let [resp (try (http-post (str server "/grout/by-fingerprint")
+                                {:fingerprints (vec batch)} verbose?)
+                     (catch Exception e {:status :error :error (ex-message e)}))]
+       (if (= 200 (:status resp))
+         (into acc (map (juxt :fingerprint identity)) (get-in resp [:json :matches]))
+         (do (when verbose?
+               (binding [*out* *err*]
+                 (println "by-fingerprint unavailable (status" (:status resp)
+                          "); falling back to full hashes")))
+             acc))))
+   {}
+   (partition-all fingerprint-batch-size (distinct fps))))
+
+(defn- attach-fingerprint! [server id fp verbose?]
+  (when verbose? (binding [*out* *err*] (println "PUT" (str server "/grout/media/" id "/fingerprint"))))
+  (http/put (str server "/grout/media/" id "/fingerprint")
+            {:headers (json-headers)
+             :body (json/generate-string {:fingerprint fp})
+             :timeout http-timeout
+             :throw false}))
+
 (defn- add-tag! [server id tag verbose?]
   (http-post (str server "/grout/media/" id "/tags") {:tag tag} verbose?))
 
@@ -378,15 +321,38 @@ Examples:
                       " status=" status
                       " tags=" (str/join "," tags)))))))
 
-(defn- process-file! [server opts tags cache file]
+(defn- find-existing
+  "Is `file` (with fingerprint `fp`) already stored? Uses the batch
+   fingerprint result when it has a match; otherwise falls back to a full
+   SHA-256 + by-hash lookup, and on a hit attaches `fp` to that item so later
+   runs match by fingerprint (skipped on --dry-run). Returns
+   {:existing by-hash-shaped-response :hash sha-or-nil}."
+  [server opts fp-matches fp file]
+  (if-let [item (get fp-matches fp)]
+    {:existing {:status 200 :json item}}
+    (let [hash     (sha256-file file)
+          verbose? (:verbose opts)
+          existing (by-hash server hash verbose?)]
+      (when (and (= 200 (:status existing))
+                 (nil? (:fingerprint (:json existing)))
+                 (not (:dry-run opts)))
+        ;; Best-effort: a failure here only means the next run hashes again.
+        (try (attach-fingerprint! server (:id (:json existing)) fp verbose?)
+             (catch Exception e
+               (binding [*out* *err*]
+                 (println (str file ": warning: could not attach fingerprint: "
+                               (or (ex-message e) (str e))))))))
+      {:existing existing :hash hash :fingerprint fp})))
+
+(defn- process-file! [server opts tags fp-matches file]
   (if-not (fs/exists? file)
     {:file file :error "file not found"}
     (let [filename-tag (str "filename:" (fs/file-name file))
           all-tags (vec (distinct (cond-> tags
                                      (not (:no-filename-tag opts)) (conj filename-tag))))
-          hash (file-hash cache file)
+          fp (fingerprint-file file)
           verbose? (:verbose opts)
-          existing (by-hash server hash verbose?)
+          {:keys [existing hash]} (find-existing server opts fp-matches fp file)
           ;; by-hash deliberately includes superseded rows (so intake can
           ;; revive them) — but every id-addressed route (tag-add, get-one)
           ;; filters them out. So a superseded hit must NOT take the retag
@@ -397,14 +363,14 @@ Examples:
       (when superseded?
         (when verbose?
           (binding [*out* *err*]
-            (println (str file ": by-hash hit is superseded (at "
+            (println (str file ": existing match is superseded (at "
                           (:superseded-at (:json existing))
                           "); treating as not stored — upload will revive it")))))
       (cond
         (and (= 200 (:status existing)) (not superseded?))
         (let [id (:id (:json existing))]
           (if (:dry-run opts)
-            {:file file :action :would-retag :id id :status 200 :tags all-tags :hash hash}
+            {:file file :action :would-retag :id id :status 200 :tags all-tags :hash hash :fingerprint fp}
             ;; Already stored: add only the missing tags. `add-tag!` is
             ;; idempotent server-side, so a re-run with the tags already present
             ;; is a clean no-op (:unchanged), never a failure. Tag-add errors are
@@ -419,22 +385,22 @@ Examples:
                                      to-add))]
               (cond
                 (seq failed)
-                {:file file :action :retag-failed :id id :status 200 :hash hash
+                {:file file :action :retag-failed :id id :status 200 :hash hash :fingerprint fp
                  :error (str "failed to add tag(s): "
                              (str/join ", " (map #(str (:tag %) " (status " (:status %) ")")
                                                  failed)))}
 
                 (seq to-add)
                 {:file file :action :retagged :id id :status 200
-                 :tags (vec (distinct (concat current all-tags))) :hash hash}
+                 :tags (vec (distinct (concat current all-tags))) :hash hash :fingerprint fp}
 
                 :else
                 {:file file :action :unchanged :id id :status 200
-                 :tags (vec current) :hash hash}))))
+                 :tags (vec current) :hash hash :fingerprint fp}))))
 
         (or (= 404 (:status existing)) superseded?)
         (if (:dry-run opts)
-          {:file file :action :would-upload :status 404 :tags all-tags :hash hash}
+          {:file file :action :would-upload :status 404 :tags all-tags :hash hash :fingerprint fp}
           (let [parts (cond-> {:kind (:kind opts)
                                :tags (str/join "," all-tags)
                                :source (:source opts)}
@@ -446,12 +412,24 @@ Examples:
             (if (#{200 201} (:status resp))
               {:file file :action (if (= 201 (:status resp)) :uploaded :deduplicated)
                :id (:id (:json resp)) :status (:status resp)
-               :tags (:tags (:json resp)) :hash hash}
+               :tags (:tags (:json resp)) :hash hash :fingerprint fp}
               {:file file :error (str "upload failed: " (or (:error (:json resp)) (:body resp)))
                :status (:status resp)})))
 
         :else
-        {:file file :error (str "unexpected by-hash status " (:status existing))}))))
+        {:file file :error (str "unexpected lookup status " (:status existing))}))))
+
+(defn- prefetch-matches
+  "Fingerprint every existing file and look them all up in one go. A file that
+   can't be read is left out; process-file! reports it."
+  [server files verbose?]
+  (let [fps (keep (fn [f] (try (fingerprint-file f) (catch Exception _ nil))) files)]
+    (lookup-fingerprints server fps verbose?)))
+
+(defn- warn-manifest-deprecated! [opts]
+  (when (:manifest opts)
+    (binding [*out* *err*]
+      (println "warning: --manifest is deprecated and ignored (fingerprint lookups replaced it)"))))
 
 (defn- enrich-by-tag! [server tag concept-name opts]
   (let [body (cond-> {:concept-name concept-name}
@@ -497,14 +475,12 @@ Examples:
       (when (empty? files)
         (binding [*out* *err*] (println (str "error: no files in " dir)))
         (System/exit 2))
-      (let [cache    (load-manifest! (:manifest opts))
-            manifest (:manifest opts)]
+      (warn-manifest-deprecated! opts)
+      (let [fp-matches (prefetch-matches server files (:verbose opts))]
         (doseq [file files]
-          (let [result (try (process-file! server opts base-tags cache file)
+          (let [result (try (process-file! server opts base-tags fp-matches file)
                             (catch Exception e {:file file :error (or (ex-message e) (str e))}))]
             (swap! tally update (classify-result result) inc)
-            (when-not (:error result)
-              (flush-manifest! cache manifest file))
             (result! json? result))))
       ;; Fire the shared enrichment for the whole directory (unless a dry run).
       ;; The request itself is always synchronous (see the enrich! note below);
@@ -592,16 +568,14 @@ Examples:
       (let [server (base-url opts)
             tags (vec (distinct (concat (:tag opts []) (split-tags (:tags opts)))))
             failures (atom 0)
-            cache (load-manifest! (:manifest opts))
-            manifest (:manifest opts)]
+            _ (warn-manifest-deprecated! opts)
+            fp-matches (prefetch-matches server (filter fs/exists? files) (:verbose opts))]
         (doseq [file files]
           (let [result (try
-                         (process-file! server opts tags cache file)
+                         (process-file! server opts tags fp-matches file)
                          (catch Exception e
                            {:file file :error (or (ex-message e) (str e))}))]
             (when (:error result) (swap! failures inc))
-            (when-not (:error result)
-              (flush-manifest! cache manifest file))
             (result! (:json opts) result)))
         (when (pos? @failures)
           (System/exit 1)))))

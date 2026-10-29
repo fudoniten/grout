@@ -36,6 +36,8 @@ contributors are in [AGENTS.md](AGENTS.md).
 |---|---|
 | `POST /grout/media` | Upload media (`multipart/form-data`): hash → probe → normalize → insert. Dedups by content hash (`201` new, `200` matched/retagged/revived) |
 | `GET /grout/by-hash/:hash` | Look up an item by SHA-256 of the source bytes (CLI pre-check) |
+| `POST /grout/by-fingerprint` | Batch existence check by sampled fingerprint (`{fingerprints: [...]}`, up to 1000). Returns `matches`, one item per stored fingerprint |
+| `PUT /grout/media/:id/fingerprint` | Attach a fingerprint to an item that has none (pre-fingerprint items) |
 | `GET /grout/media` | Query by `channel`, `tags` (AND), `min_ms`/`max_ms`, `kind`, `random`, `limit`, `offset`. Summaries carry `kind`/`channel`/`description`/`source` so a consumer can sync without per-item fetches |
 | `GET /grout/media/:id` | Fetch one |
 | `PATCH /grout/media/:id` | Mutate `name`/`description`/`tags`/`channel` |
@@ -75,6 +77,15 @@ tag it, just upload again with tags. A CLI can hash the local file, `GET
 /grout/by-hash/:hash` to see whether an upload is even needed, and on a hit
 simply add tags via `PATCH`/`POST …/tags` without re-uploading (see
 `grout-cli` below, which does exactly this).
+
+Items also carry a `fingerprint`: `fp1:` + SHA-256 over the file size and
+three 64 KiB samples (start, middle, end) of the original bytes. It reads at
+most 192 KiB per file, so clients use it for the "is this already stored?"
+check (`POST /grout/by-fingerprint`) instead of a full hash. Two different
+media files matching on size and all three samples is vanishingly rare but
+possible, so `content-hash` stays the authoritative dedup key at intake.
+Items stored before fingerprints existed have none until a client that matched
+them by full hash attaches one.
 
 ## AI enrichment
 
@@ -126,9 +137,13 @@ A Babashka CLI for tagging/uploading filler media, built by the flake as
 your profile). No shared filesystem with the server is required — it works
 from any desktop or CI runner that can reach the Grout HTTP endpoint.
 
-For each file it hashes the bytes with the same SHA-256 the server uses for
-its content-hash dedup key, checks `GET /grout/by-hash/:hash`, and either
-adds tags to the existing item or intakes it as new. Every file also gets a
+It fingerprints every file and checks them all in one `POST
+/grout/by-fingerprint`. A file that doesn't match gets a full SHA-256 and a
+`GET /grout/by-hash/:hash`, which catches items stored before fingerprints
+existed (on a hit the CLI attaches the fingerprint, so the next run is fast).
+Then it either adds tags to the existing item or intakes it as new. Re-running
+over already-uploaded files costs about 192 KiB of reads per file, so the CLI
+keeps no local state (`--manifest` is accepted but ignored). Every file also gets a
 `filename:<basename>` tag by default, so the original name stays searchable.
 
 ```sh
@@ -153,9 +168,10 @@ directory that directly contains files** it runs
 `grout-cli --upload-dir <dir> --json`, capturing the per-file JSON as a
 per-directory manifest and recording per-directory progress in a JSON state
 file. A crash, kill, or pod eviction resumes without redoing finished work: a
-directory already marked `done` is skipped entirely, so **its files are never
-re-hashed**. Path is treated as identity — nothing re-reads bytes to decide
-whether a directory is already uploaded.
+directory already marked `done` is skipped entirely. The state is a convenience
+for progress and `retry`, not a correctness requirement: since grout-cli's
+fingerprint check makes re-running a finished directory cheap, losing or
+`reset`-ing the state file just means one quick re-check pass.
 
 Because `grout-cli --upload-dir` is non-recursive and keys its shared enrichment
 profile on the *parent* of each leaf, the common pinchflat layout
@@ -176,7 +192,7 @@ grout-bulk --help
 Commands: `run` (resumes; skips `done`, re-runs crashed `in_progress`), `retry`
 (re-runs only `failed` directories, e.g. after a Grout outage), `status`
 (counts + per-directory table; `--json` for `jq`), `reset` (drop a root's state
-file — logs and grout-cli's by-hash dedup remain the safety net). Anything after
+file; the next run re-checks every directory by fingerprint). Anything after
 `--` is forwarded verbatim to every `grout-cli` call
 (`grout-bulk run -r … -- --kind=filler --tag=music`). The server comes from
 `-s`/`--server` or `$GROUT_URL`; keep `--state-dir` on a persistent volume,

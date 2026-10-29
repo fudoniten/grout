@@ -84,158 +84,71 @@
     (is (= :failed (classify-result {:action :retag-failed
                                      :error "failed to add tag(s): x (status 500)"})))))
 
-;; --- Manifest cache: (path, size, mtime) -> sha256 --------------------------
+;; --- Fingerprint ------------------------------------------------------------
 ;;
-;; Resumable uploads. The CLI hashes every file (local I/O) before it can
-;; look the hash up in Grout, so for 200k items the resume case — "the
-;; last run uploaded 50k items and then crashed" — is the dominant cost.
-;; The manifest makes resumes free: a re-run reads (path, size, mtime)
-;; triples, and only re-hashes files where size or mtime changed.
-;;
-;; The tests below exercise the cache primitives end-to-end against real
-;; files in a temp directory. They are designed to be deterministic (no
-;; mock layer) because the file-hash helper is small enough that
-;; integration tests are clearer than unit tests.
+;; The CLI and the server must compute identical fingerprints, or every lookup
+;; misses and falls back to a full hash. These vectors are shared with
+;; test/grout/media/hash_test.clj (and were derived independently in Python).
 
 (defn- with-tmp-dir
-  "Run `f` with a freshly-created temp dir bound to `tmp`. Removes the
-   dir on exit, swallowing any teardown error."
+  "Run `f` with a freshly-created temp dir. Removes the dir on exit,
+   swallowing any teardown error."
   [f]
   (let [tmp (fs/create-temp-dir)]
     (try (f tmp)
       (finally
         (try (fs/delete-tree tmp) (catch Exception _ nil))))))
 
-(defn- tmp-file
-  "Create a file in `dir` named `name` with `n` random bytes, returning
-   the path. The name is provided by the caller so two tmp-files in
-   the same test don't collide on `fixture.bin`."
+(defn- pattern-file
+  "Create `name` in `dir` holding `n` bytes where byte i is (i mod 251)."
   [dir name n]
-  (let [p (str (fs/file dir name))
-        _  (with-open [out (clojure.java.io/output-stream p)]
-             (.write out (byte-array n)))]
+  (let [p (str (fs/file dir name))]
+    (with-open [out (clojure.java.io/output-stream p)]
+      (.write out (byte-array (map #(unchecked-byte (mod % 251)) (range n)))))
     p))
 
-(deftest manifest-key--absolutizes-and-stat-s
-  (testing "the cache key is (abs-path, size, mtime-seconds)"
-    (with-tmp-dir
-      (fn [dir]
-        (let [p (tmp-file dir "a.bin" 42)
-              [abs sz mt] (manifest-key p)]
-          (is (= abs (str (fs/absolutize p))) "absolutize the path")
-          (is (= 42 sz) "size in bytes")
-          (is (and (integer? mt) (pos? mt)) "mtime in seconds since epoch"))))))
+(deftest fingerprint-file--matches-server-vectors
+  (with-tmp-dir
+    (fn [dir]
+      (is (= "fp1:976162828ad3ba7f1c0c6253d65b546ee2ea03a4fd3e8d9e84d61706bac0bce8"
+             (fingerprint-file (pattern-file dir "small.bin" 3)))
+          "small file: whole-file hash")
+      (is (= "fp1:1dd735f6779c0b12387c59a61b31276173092c692e950f846cb482580837719b"
+             (fingerprint-file (pattern-file dir "large.bin" 1000000)))
+          "large file: three samples"))))
 
-(deftest manifest-key--tolerates-trailing-slash
-  (testing "trailing-slash and no-slash variants map to the same key"
-    (with-tmp-dir
-      (fn [dir]
-        (let [p (tmp-file dir "a.bin" 100)]
-          (is (= (manifest-key p) (manifest-key (str p "/")))))))))
+(deftest lookup-fingerprints--batches-and-maps-by-fingerprint
+  (let [fps   (mapv #(str "fp1:" (format "%064x" %)) (range 1200))
+        calls (atom [])]
+    (with-redefs [http-post (fn [_url body _v]
+                              (swap! calls conj (count (:fingerprints body)))
+                              {:status 200
+                               :json {:matches [{:id "x" :fingerprint (first (:fingerprints body))}]}})]
+      (let [m (lookup-fingerprints "http://g" fps false)]
+        (is (= [500 500 200] @calls) "one request per 500 fingerprints")
+        (is (= #{(nth fps 0) (nth fps 500) (nth fps 1000)} (set (keys m)))
+            "keys come back as the fingerprint strings")))))
 
-(deftest load-manifest!--empty-when-missing
-  (testing "a non-existent path returns an empty cache without erroring"
-    (with-tmp-dir
-      (fn [dir]
-        (let [mp (str (fs/file dir "nope.jsonl"))
-              cache (load-manifest! mp)]
-          (is (empty? @cache)))))))
+(deftest lookup-fingerprints--old-server-means-no-matches
+  (with-redefs [http-post (fn [_ _ _] {:status 404 :json {:error "Not found"}})]
+    (is (= {} (lookup-fingerprints "http://g" ["fp1:aa"] false))
+        "every file then falls back to the full-hash lookup")))
 
-(deftest load-manifest!--round-trips-valid-rows
-  (testing "rows written by flush-manifest! are read back identically"
-    (with-tmp-dir
-      (fn [dir]
-        (let [p1 (tmp-file dir "a.bin" 16)
-              p2 (tmp-file dir "b.bin" 64)
-              mp (str (fs/file dir "manifest.jsonl"))
-              cache (load-manifest! mp)]
-          (file-hash cache p1)
-          (file-hash cache p2)
-          (is (flush-manifest! cache mp p1))
-          (is (flush-manifest! cache mp p2))
-          (let [reloaded (load-manifest! mp)]
-            (is (= 2 (count @reloaded))
-                "both rows come back from disk")
-            (is (= (file-hash (atom {}) p1) (get @reloaded (manifest-key p1)))
-                "row 1 hash matches a fresh hash")
-            (is (= (file-hash (atom {}) p2) (get @reloaded (manifest-key p2)))
-                "row 2 hash matches a fresh hash")))))))
+(deftest find-existing--fingerprint-hit-skips-full-hash
+  (with-redefs [sha256-file (fn [_] (throw (ex-info "should not hash" {})))]
+    (is (= {:existing {:status 200 :json {:id "x"}}}
+           (find-existing "http://g" {} {"fp1:aa" {:id "x"}} "fp1:aa" "/f")))))
 
-(deftest load-manifest!--skips-malformed-lines
-  (testing "garbage lines are skipped, valid lines survive"
-    (with-tmp-dir
-      (fn [dir]
-        (let [p  (tmp-file dir "a.bin" 32)
-              mp (str (fs/file dir "m.jsonl"))
-              ;; Write one valid row and one garbage row.
-              [abs sz mt] (manifest-key p)
-              sha (file-hash (atom {}) p)]
-          (spit mp (str "not json\n"
-                        (json/generate-string {:path abs :size sz :mtime mt :hash sha})
-                        "\n"
-                        "{also not json}\n"))
-          (let [cache (load-manifest! mp)]
-            (is (= 1 (count @cache))
-                "the one valid row came back; garbage was skipped")
-            (is (= sha (get @cache (manifest-key p))))))))))
-
-(deftest file-hash--cache-hit-skips-rehash
-  (testing "a (path, size, mtime) cache hit returns the cached value without re-hashing"
-    (with-tmp-dir
-      (fn [dir]
-        (let [p  (tmp-file dir "a.bin" 1024)
-              k  (manifest-key p)
-              cache (atom {k "deadbeefcafebabe0123456789abcdef0123456789abcdef0123456789abcdef"})]
-          (is (= "deadbeefcafebabe0123456789abcdef0123456789abcdef0123456789abcdef"
-                 (file-hash cache p))
-              "the cached hash is returned without re-reading the file"))))))
-
-(deftest file-hash--cache-miss-hashes-and-remembers
-  (testing "a miss computes the hash, then returns it (and remembers it)"
-    (with-tmp-dir
-      (fn [dir]
-        (let [p     (tmp-file dir "a.bin" 1024)
-              cache (atom {})
-              h1    (file-hash cache p)
-              h2    (file-hash cache p)]
-          (is (= 64 (count h1)) "sha256 is 64 hex chars")
-          (is (re-matches #"[0-9a-f]{64}" h1))
-          (is (= h1 h2) "second call returns the same value")
-          (is (= h1 (get @cache (manifest-key p)))
-              "the cache remembers the hash for the rest of the run"))))))
-
-(deftest flush-manifest!--no-op-when-path-blank
-  (testing "no manifest path => no write, no error"
-    (let [cache (atom {})]
-      (is (nil? (flush-manifest! cache nil "/some/file"))
-          "returns nil on no-op; doesn't throw"))))
-
-(deftest flush-manifest!--survives-unwritable-target
-  (testing "a path the process can't write to is a warning, not a failure"
-    (let [cache (atom {})]
-      ;; /proc/1/cmdline is a real read-only file, not a directory.
-      (is (nil? (flush-manifest! cache "/proc/1/cmdline" "/some/file"))
-          "returns nil rather than throwing"))))
-
-(deftest manifest-roundtrip--size-change-invalidates
-  (testing "changing a file's size forces a re-hash on the next read"
-    (with-tmp-dir
-      (fn [dir]
-        (let [p  (tmp-file dir "a.bin" 100)
-              mp (str (fs/file dir "m.jsonl"))
-              cache-1 (load-manifest! mp)]
-          (file-hash cache-1 p) ; populate the cache so flush-manifest! has a row to write
-          (is (flush-manifest! cache-1 mp p))
-          (let [sha-100 (get @cache-1 (manifest-key p))]
-            (is (= sha-100 (get @(load-manifest! mp) (manifest-key p)))
-                "100-byte file is in the cache")
-            (Thread/sleep 1100)
-            ;; Overwrite with a different size. mtime also advances, so
-            ;; the cache key (path, size, mtime) changes too.
-            (tmp-file dir "a.bin" 200)
-            (let [cache-2 (load-manifest! mp)]
-              (is (nil? (get @cache-2 (manifest-key p)))
-                  "the changed file is a cache miss (checked before hashing)")
-              (let [sha-200 (file-hash cache-2 p)]
-                (is (not= sha-100 sha-200)
-                    "the new hash is the new content's, not the cached one")))))))))
+(deftest find-existing--hash-hit-attaches-fingerprint
+  (let [attached (atom nil)]
+    (with-redefs [sha256-file (fn [_] "h")
+                  by-hash (fn [_ _ _] {:status 200 :json {:id "x" :fingerprint nil}})
+                  attach-fingerprint! (fn [_ id fp _] (reset! attached [id fp]))]
+      (is (= "h" (:hash (find-existing "http://g" {} {} "fp1:aa" "/f"))))
+      (is (= ["x" "fp1:aa"] @attached)))
+    (reset! attached nil)
+    (with-redefs [sha256-file (fn [_] "h")
+                  by-hash (fn [_ _ _] {:status 200 :json {:id "x" :fingerprint nil}})
+                  attach-fingerprint! (fn [_ id fp _] (reset! attached [id fp]))]
+      (find-existing "http://g" {:dry-run true} {} "fp1:aa" "/f")
+      (is (nil? @attached) "a dry run changes nothing on the server"))))

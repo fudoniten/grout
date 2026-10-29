@@ -5,11 +5,10 @@
 ;; it shells out to `grout-cli --upload-dir <dir> --json`, capturing the
 ;; per-file JSON manifest and recording per-directory progress in a JSON state
 ;; file. A crash, kill, or pod eviction resumes without re-doing finished work:
-;; a directory marked `done` is skipped entirely, so its files are never
-;; re-hashed. Path is treated as identity — nothing re-reads bytes to decide
-;; whether a directory is already uploaded; the state file is the source of
-;; truth, and grout-cli's own by-hash dedup is the safety net if a partial
-;; directory is re-run.
+;; a directory marked `done` is skipped entirely. The state file is a
+;; convenience (progress, status, retry), not a correctness requirement:
+;; grout-cli checks every file by sampled fingerprint, so re-running a finished
+;; or partial directory only costs ~192 KiB of reads per file.
 ;;
 ;; Why per *directory* and not per *file*: grout-cli's unit of work is a
 ;; directory (`--upload-dir`, non-recursive), and it fires one shared
@@ -46,8 +45,8 @@ Commands:
             Use after fixing whatever made them fail (e.g. a Grout outage).
   status    Print progress for --root (counts + per-directory breakdown). No
             work is done. Add --json for machine-readable output.
-  reset     Delete the state file for --root (logs/manifests are kept, so a
-            re-run still benefits from grout-cli's by-hash dedup). --all deletes
+  reset     Delete the state file for --root (logs/manifests are kept; a re-run
+            cheaply re-checks every file by fingerprint). --all deletes
             every root's state file.
 
 Options:

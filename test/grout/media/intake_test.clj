@@ -8,6 +8,7 @@
 (deftest dedup-unions-tags-fills-blanks-and-revives
   (let [captured (atom nil)]
     (with-redefs [hash/sha256-file    (fn [_] "h1")
+                  hash/fingerprint-file (fn [_] "fp1:test")
                   store/find-by-hash  (fn [_ _] {:id 7 :tags ["old"] :name "Kept"
                                                  :description nil :channel nil
                                                  :superseded_at :some-ts})
@@ -24,7 +25,8 @@
           (is (= "Kept" (:name fields)) "human name preserved")
           (is (= "fresh" (:description fields)) "blank description filled")
           (is (= "britannia" (:channel fields)) "blank channel filled")
-          (is (nil? (:superseded_at fields)) "revived"))))))
+          (is (nil? (:superseded_at fields)) "revived")
+          (is (= "fp1:test" (:fingerprint fields)) "fingerprint backfilled on a row without one"))))))
 
 (deftest derive-kind-splits-on-15-minutes
   ;; Bumpers preserved; everything else filler under 15 min, program at/over it.
@@ -40,6 +42,7 @@
 (deftest new-item-derives-kind-from-duration
   (let [created (atom nil)]
     (with-redefs [hash/sha256-file    (fn [_] "abcd")
+                  hash/fingerprint-file (fn [_] "fp1:test")
                   store/find-by-hash  (fn [_ _] nil)
                   probe/normalize-to! (fn [_ out _] {:path out
                                                      :probe {:duration-ms (* 44 60 1000)}
@@ -53,6 +56,7 @@
 (deftest new-item-normalizes-and-inserts
   (let [created (atom nil)]
     (with-redefs [hash/sha256-file     (fn [_] "abcd")
+                  hash/fingerprint-file (fn [_] "fp1:test")
                   store/find-by-hash   (fn [_ _] nil)
                   probe/normalize-to!  (fn [_ out _] {:path out
                                                       :probe {:duration-ms 5000
@@ -65,11 +69,13 @@
         (is (false? deduplicated))
         (is (= "/data/media/grout/ab/abcd.mp4" (:path @created)) "content-addressed path")
         (is (= "abcd" (:content_hash @created)))
+        (is (= "fp1:test" (:fingerprint @created)) "fingerprint of the received bytes is stored")
         (is (= 5000 (:duration_ms @created)))
         (is (false? (:enriched @created)))))))
 
 (deftest new-item-without-duration-throws
   (with-redefs [hash/sha256-file    (fn [_] "abcd")
+                  hash/fingerprint-file (fn [_] "fp1:test")
                 store/find-by-hash  (fn [_ _] nil)
                 probe/normalize-to! (fn [_ out _] {:path out :probe {} :normalized false})]
     (is (thrown? clojure.lang.ExceptionInfo
@@ -84,6 +90,7 @@
   (let [calls  (atom 0)
         merged (atom nil)]
     (with-redefs [hash/sha256-file     (fn [_] "dupehash")
+                  hash/fingerprint-file (fn [_] "fp1:test")
                   ;; miss on the pre-check (call 1), hit on the post-violation retry
                   store/find-by-hash   (fn [_ _]
                                          (when (> (swap! calls inc) 1)
@@ -111,6 +118,7 @@
   ;; Only a unique violation is swallowed as a dedup; any other DB error must
   ;; still surface so it isn't silently misreported as a successful store.
   (with-redefs [hash/sha256-file    (fn [_] "h1")
+                  hash/fingerprint-file (fn [_] "fp1:test")
                 store/find-by-hash  (fn [_ _] nil)
                 probe/normalize-to! (fn [_ out _] {:path out :probe {:duration-ms 1000} :normalized false})
                 store/create!       (fn [_ _] (throw (java.sql.SQLException. "connection lost" "08006")))]
