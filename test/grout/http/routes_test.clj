@@ -130,6 +130,17 @@
         (is (= (str "/grout/media/" sample-id "/stream") (:stream-url item)))
         (is (= ["daytime" "fun"] (:tags item)))))))
 
+(deftest query-summaries-keep-every-channel
+  ;; Response coercion strips keys the schema doesn't declare, so a missing
+  ;; :channels entry in MediaSummary silently dropped every channel after the
+  ;; first for consumers (Pseudovision's content sync) reading this endpoint.
+  (with-redefs [store/query (fn [_ _] [(assoc sample-row :channels ["britannia" "muse"])])]
+    (let [resp (call (handler) (mock/request :get "/grout/media?kind=program"))
+          item (first (get-in resp [:body :items]))]
+      (is (= 200 (:status resp)))
+      (is (= "britannia" (:channel item)))
+      (is (= ["britannia" "muse"] (:channels item))))))
+
 (deftest query-passes-parsed-params-to-store
   (let [captured (atom nil)]
     (with-redefs [store/query (fn [_ params] (reset! captured params) [])]
