@@ -65,6 +65,8 @@
    [:name {:optional true} [:maybe {:description "Human/AI title."} :string]]
    [:description {:optional true} [:maybe {:description "Human/AI description."} :string]]
    [:channel {:optional true} [:maybe {:description "Channel, or null for generic items."} :string]]
+   [:channels {:optional true} [:maybe {:description "Full set of channels this item may play on (see Media.channels). Must be listed here: response coercion strips undeclared keys, so without it consumers syncing from the query endpoint only ever saw the first channel."}
+                                [:vector :string]]]
    [:duration-ms [:int {:description "Duration in milliseconds."}]]
    [:width {:optional true} [:maybe {:description "Video width in pixels."} :int]]
    [:height {:optional true} [:maybe {:description "Video height in pixels."} :int]]
